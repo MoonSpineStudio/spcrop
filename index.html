@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Sprite Layer Tool</title>
+    <title>Super Crop</title>
   </head>
   <body>
     <div class="app">
@@ -35,7 +35,10 @@
           <input id="targetH" type="number" value="128" min="1" />
         </div>
         <button id="createLayerBtn" type="button">从框选生成新图层 (R/Enter)</button>
+        <button id="copyCropBtn" type="button">复制框选内容 (Ctrl/Cmd+C)</button>
+        <button id="pasteCropBtn" type="button">粘贴为新图层 (Ctrl/Cmd+V)</button>
         <button id="setCropRectBtn" type="button">一键创建框选（使用目标尺寸） (B)</button>
+        <button id="removeFakeBgBtn" type="button">去除仿PNG背景（选中优先） (P)</button>
 
         <h2>图层列表（可多选）</h2>
         <ul id="layerList" class="layer-list"></ul>
@@ -46,7 +49,7 @@
         <button id="alignVBtn" type="button">选中图层纵向排列 (V)</button>
         <button id="deleteBtn" type="button">删除选中图层 (Delete/Backspace)</button>
         <button id="exportBtn" type="button">导出 PNG（选中优先） (E)</button>
-        <p class="tips">提示：滚轮可上下左右平移画布；中键也可拖动画布。缩放修饰键可在下方设置（默认 Alt/Option(⌥)+滚轮）。画布带像素标尺。框选后可拖动选框，Shift 锁定 1:1。</p>
+        <p class="tips">提示：滚轮可上下左右平移画布；中键也可拖动画布。缩放修饰键可在下方设置（默认 Alt/Option(⌥)+滚轮）。画布带像素标尺。框选后可拖动选框，Shift 锁定 1:1。支持一键去除仿 PNG 格子背景，也支持 Ctrl/Cmd+C 复制框选、Ctrl/Cmd+V 粘贴为新图层。按 Backspace 可删除框选内容（无框选时删除选中图层）。在画布中可用 Alt/Option+点击进行多图层点选。</p>
 
         <h2>快捷键设置</h2>
         <div class="row">

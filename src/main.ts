@@ -30,11 +30,43 @@ interface DraggingGroupItem {
   startY: number;
 }
 
+interface RgbColor {
+  r: number;
+  g: number;
+  b: number;
+}
+
+interface FakeBgRemovalResult {
+  removedPixels: number;
+  adjustedPixels: number;
+}
+
+interface CheckerPattern {
+  tile: number;
+  offsetX: number;
+  offsetY: number;
+  invert: boolean;
+  accuracy: number;
+}
+
+interface CropSelectionSlice {
+  layer: Layer;
+  sx: number;
+  sy: number;
+  sw: number;
+  sh: number;
+  worldX: number;
+  worldY: number;
+}
+
 type ShortcutAction =
   | "toggleCropMode"
   | "clearCrop"
   | "createLayerFromCrop"
+  | "copyCropSelection"
+  | "pasteCropSelection"
   | "setPresetCropRect"
+  | "removeFakePngBg"
   | "spreadLayers"
   | "alignHorizontal"
   | "alignVertical"
@@ -56,7 +88,10 @@ const SHORTCUT_DEFS: ShortcutDef[] = [
   { action: "toggleCropMode", label: "开始/结束框选", defaultKey: "C" },
   { action: "clearCrop", label: "清除框选", defaultKey: "X" },
   { action: "createLayerFromCrop", label: "从框选生成新图层", defaultKey: "R" },
+  { action: "copyCropSelection", label: "复制框选内容", defaultKey: "Ctrl+C" },
+  { action: "pasteCropSelection", label: "粘贴框选内容", defaultKey: "Ctrl+V" },
   { action: "setPresetCropRect", label: "一键创建框选", defaultKey: "B" },
+  { action: "removeFakePngBg", label: "去除仿 PNG 背景", defaultKey: "P" },
   { action: "spreadLayers", label: "自动散开图层", defaultKey: "G" },
   { action: "alignHorizontal", label: "横向排列", defaultKey: "H" },
   { action: "alignVertical", label: "纵向排列", defaultKey: "V" },
@@ -90,6 +125,8 @@ interface AppState {
   capturingShortcutFor: ShortcutAction | null;
   draggingGroup: DraggingGroupItem[] | null;
   dragStartPointer: Point | null;
+  clipboardImage: HTMLCanvasElement | null;
+  clipboardPasteCursor: Point | null;
 }
 
 function mustGet<T extends HTMLElement>(id: string): T {
@@ -123,7 +160,10 @@ const statusText = mustGet<HTMLSpanElement>("statusText");
 const cropModeBtn = mustGet<HTMLButtonElement>("cropModeBtn");
 const clearCropBtn = mustGet<HTMLButtonElement>("clearCropBtn");
 const createLayerBtn = mustGet<HTMLButtonElement>("createLayerBtn");
+const copyCropBtn = mustGet<HTMLButtonElement>("copyCropBtn");
+const pasteCropBtn = mustGet<HTMLButtonElement>("pasteCropBtn");
 const setCropRectBtn = mustGet<HTMLButtonElement>("setCropRectBtn");
+const removeFakeBgBtn = mustGet<HTMLButtonElement>("removeFakeBgBtn");
 const spreadBtn = mustGet<HTMLButtonElement>("spreadBtn");
 const alignHBtn = mustGet<HTMLButtonElement>("alignHBtn");
 const alignVBtn = mustGet<HTMLButtonElement>("alignVBtn");
@@ -168,6 +208,8 @@ const state: AppState = {
   capturingShortcutFor: null,
   draggingGroup: null,
   dragStartPointer: null,
+  clipboardImage: null,
+  clipboardPasteCursor: null,
 };
 
 function setStatus(text: string): void {
@@ -264,6 +306,527 @@ function defaultLayerPosition(index: number): Point {
   return {
     x: padding + col * cell,
     y: padding + row * cell,
+  };
+}
+
+function clampByte(value: number): number {
+  return Math.max(0, Math.min(255, Math.round(value)));
+}
+
+function colorDistanceSq(a: RgbColor, b: RgbColor): number {
+  const dr = a.r - b.r;
+  const dg = a.g - b.g;
+  const db = a.b - b.b;
+  return dr * dr + dg * dg + db * db;
+}
+
+function layerToEditableCanvas(layer: Layer): HTMLCanvasElement | null {
+  if (layer.image instanceof HTMLCanvasElement) {
+    return layer.image;
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.width = layer.width;
+  canvas.height = layer.height;
+  const cctx = canvas.getContext("2d");
+  if (!cctx) {
+    return null;
+  }
+
+  cctx.drawImage(layer.image, 0, 0, layer.width, layer.height);
+  layer.image = canvas;
+  return canvas;
+}
+
+function classifyPixelToBg(
+  data: Uint8ClampedArray,
+  pixelIndex: number,
+  bgA: RgbColor,
+  bgB: RgbColor,
+  toleranceSq: number,
+): number {
+  const offset = pixelIndex * 4;
+  if (data[offset + 3] < 220) {
+    return -1;
+  }
+  const color: RgbColor = { r: data[offset], g: data[offset + 1], b: data[offset + 2] };
+  const d1 = colorDistanceSq(color, bgA);
+  const d2 = colorDistanceSq(color, bgB);
+  const minDist = Math.min(d1, d2);
+  if (minDist > toleranceSq) {
+    return -1;
+  }
+  return d1 <= d2 ? 0 : 1;
+}
+
+function detectFakeBgColors(data: Uint8ClampedArray, width: number, height: number): [RgbColor, RgbColor] | null {
+  if (width < 2 || height < 2) {
+    return null;
+  }
+
+  const ALPHA_MIN = 220;
+  const QUANT = 8;
+
+  type Bucket = {
+    count: number;
+    sumR: number;
+    sumG: number;
+    sumB: number;
+  };
+  const buckets = new Map<string, Bucket>();
+
+  const addSample = (x: number, y: number): void => {
+    const idx = (y * width + x) * 4;
+    if (data[idx + 3] < ALPHA_MIN) {
+      return;
+    }
+    const r = data[idx];
+    const g = data[idx + 1];
+    const b = data[idx + 2];
+    const qr = Math.round(r / QUANT) * QUANT;
+    const qg = Math.round(g / QUANT) * QUANT;
+    const qb = Math.round(b / QUANT) * QUANT;
+    const key = `${qr},${qg},${qb}`;
+    const bucket = buckets.get(key);
+    if (bucket) {
+      bucket.count += 1;
+      bucket.sumR += r;
+      bucket.sumG += g;
+      bucket.sumB += b;
+      return;
+    }
+    buckets.set(key, {
+      count: 1,
+      sumR: r,
+      sumG: g,
+      sumB: b,
+    });
+  };
+
+  for (let x = 0; x < width; x++) {
+    addSample(x, 0);
+    addSample(x, height - 1);
+  }
+  for (let y = 1; y < height - 1; y++) {
+    addSample(0, y);
+    addSample(width - 1, y);
+  }
+
+  if (buckets.size < 2) {
+    return null;
+  }
+
+  const ranked = [...buckets.values()]
+    .filter((b) => b.count >= 6)
+    .sort((a, b) => b.count - a.count)
+    .map((b) => ({
+      count: b.count,
+      color: {
+        r: Math.round(b.sumR / b.count),
+        g: Math.round(b.sumG / b.count),
+        b: Math.round(b.sumB / b.count),
+      },
+    }));
+
+  if (ranked.length < 2) {
+    return null;
+  }
+
+  const first = ranked[0];
+  const MIN_SECOND_COUNT = Math.max(6, Math.floor(first.count * 0.08));
+  const MIN_PAIR_DISTANCE = 144; // 12^2
+
+  for (let i = 1; i < ranked.length; i++) {
+    const candidate = ranked[i];
+    if (candidate.count < MIN_SECOND_COUNT) {
+      continue;
+    }
+    if (colorDistanceSq(first.color, candidate.color) < MIN_PAIR_DISTANCE) {
+      continue;
+    }
+    return [first.color, candidate.color];
+  }
+
+  return null;
+}
+
+function collectBorderRuns(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number,
+  bgA: RgbColor,
+  bgB: RgbColor,
+  toleranceSq: number,
+): number[] {
+  const runs: number[] = [];
+
+  const scanHorizontal = (y: number): void => {
+    let prev = -1;
+    let run = 0;
+    for (let x = 0; x < width; x++) {
+      const cls = classifyPixelToBg(data, y * width + x, bgA, bgB, toleranceSq);
+      if (cls !== prev) {
+        if (prev !== -1 && run >= 2) {
+          runs.push(run);
+        }
+        prev = cls;
+        run = cls === -1 ? 0 : 1;
+        continue;
+      }
+      if (cls !== -1) {
+        run += 1;
+      }
+    }
+    if (prev !== -1 && run >= 2) {
+      runs.push(run);
+    }
+  };
+
+  const scanVertical = (x: number): void => {
+    let prev = -1;
+    let run = 0;
+    for (let y = 0; y < height; y++) {
+      const cls = classifyPixelToBg(data, y * width + x, bgA, bgB, toleranceSq);
+      if (cls !== prev) {
+        if (prev !== -1 && run >= 2) {
+          runs.push(run);
+        }
+        prev = cls;
+        run = cls === -1 ? 0 : 1;
+        continue;
+      }
+      if (cls !== -1) {
+        run += 1;
+      }
+    }
+    if (prev !== -1 && run >= 2) {
+      runs.push(run);
+    }
+  };
+
+  scanHorizontal(0);
+  if (height > 1) {
+    scanHorizontal(height - 1);
+  }
+  scanVertical(0);
+  if (width > 1) {
+    scanVertical(width - 1);
+  }
+
+  return runs;
+}
+
+function buildTileCandidates(runs: number[], maxTile: number): number[] {
+  const candidates = new Set<number>();
+  const baseCandidates = [4, 6, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 56, 64];
+  for (const value of baseCandidates) {
+    if (value <= maxTile) {
+      candidates.add(value);
+    }
+  }
+
+  const histogram = new Map<number, number>();
+  for (const run of runs) {
+    if (run < 2 || run > maxTile) {
+      continue;
+    }
+    histogram.set(run, (histogram.get(run) ?? 0) + 1);
+  }
+
+  const topRuns = [...histogram.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 6)
+    .map(([run]) => run);
+  for (const run of topRuns) {
+    for (const candidate of [run - 1, run, run + 1, run * 2]) {
+      if (candidate >= 2 && candidate <= maxTile) {
+        candidates.add(candidate);
+      }
+    }
+  }
+
+  return [...candidates].sort((a, b) => a - b);
+}
+
+function collectBorderSamples(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number,
+  bgA: RgbColor,
+  bgB: RgbColor,
+  toleranceSq: number,
+): Array<{ x: number; y: number; label: number }> {
+  const raw: Array<{ x: number; y: number; label: number }> = [];
+  const add = (x: number, y: number): void => {
+    const label = classifyPixelToBg(data, y * width + x, bgA, bgB, toleranceSq);
+    if (label === -1) {
+      return;
+    }
+    raw.push({ x, y, label });
+  };
+
+  for (let x = 0; x < width; x++) {
+    add(x, 0);
+    if (height > 1) {
+      add(x, height - 1);
+    }
+  }
+  for (let y = 1; y < height - 1; y++) {
+    add(0, y);
+    if (width > 1) {
+      add(width - 1, y);
+    }
+  }
+
+  if (raw.length <= 384) {
+    return raw;
+  }
+
+  const step = Math.ceil(raw.length / 384);
+  const compact: Array<{ x: number; y: number; label: number }> = [];
+  for (let i = 0; i < raw.length; i += step) {
+    compact.push(raw[i]);
+  }
+  return compact;
+}
+
+function findCheckerPattern(
+  samples: Array<{ x: number; y: number; label: number }>,
+  tileCandidates: number[],
+): CheckerPattern | null {
+  if (samples.length < 40 || tileCandidates.length === 0) {
+    return null;
+  }
+
+  let best: CheckerPattern | null = null;
+
+  for (const tile of tileCandidates) {
+    for (let offsetX = 0; offsetX < tile; offsetX++) {
+      for (let offsetY = 0; offsetY < tile; offsetY++) {
+        let scoreNormal = 0;
+        let scoreInvert = 0;
+        for (const sample of samples) {
+          const parity =
+            (Math.floor((sample.x + offsetX) / tile) + Math.floor((sample.y + offsetY) / tile)) & 1;
+          if (sample.label === parity) {
+            scoreNormal += 1;
+          } else {
+            scoreInvert += 1;
+          }
+        }
+
+        const score = Math.max(scoreNormal, scoreInvert);
+        const invert = scoreInvert > scoreNormal;
+        const accuracy = score / samples.length;
+        if (!best || accuracy > best.accuracy) {
+          best = {
+            tile,
+            offsetX,
+            offsetY,
+            invert,
+            accuracy,
+          };
+        }
+      }
+    }
+  }
+
+  return best;
+}
+
+function predictBgIndex(x: number, y: number, pattern: CheckerPattern): number {
+  const parity = (Math.floor((x + pattern.offsetX) / pattern.tile) + Math.floor((y + pattern.offsetY) / pattern.tile)) & 1;
+  return pattern.invert ? (1 - parity) : parity;
+}
+
+function removeFakeCheckerBackground(layer: Layer): FakeBgRemovalResult | null {
+  const canvas = layerToEditableCanvas(layer);
+  if (!canvas) {
+    return null;
+  }
+
+  const cctx = canvas.getContext("2d");
+  if (!cctx) {
+    return null;
+  }
+
+  const width = canvas.width;
+  const height = canvas.height;
+  if (width <= 0 || height <= 0) {
+    return null;
+  }
+
+  const imageData = cctx.getImageData(0, 0, width, height);
+  const data = imageData.data;
+  const colors = detectFakeBgColors(data, width, height);
+  if (!colors) {
+    return null;
+  }
+
+  const [bgA, bgB] = colors;
+  const pairDistance = Math.sqrt(colorDistanceSq(bgA, bgB));
+  const classifyTolerance = clamp(Math.round(pairDistance * 0.42), 12, 36);
+  const classifyToleranceSq = classifyTolerance * classifyTolerance;
+
+  const borderRuns = collectBorderRuns(data, width, height, bgA, bgB, classifyToleranceSq);
+  const maxTile = clamp(Math.floor(Math.min(width, height) / 2), 8, 64);
+  const tileCandidates = buildTileCandidates(borderRuns, maxTile);
+  const borderSamples = collectBorderSamples(data, width, height, bgA, bgB, classifyToleranceSq);
+  const checkerPattern = findCheckerPattern(borderSamples, tileCandidates);
+  if (!checkerPattern || checkerPattern.accuracy < 0.82) {
+    return null;
+  }
+
+  const removeTolerance = clamp(classifyTolerance + 7, 14, 44);
+  const removeToleranceSq = removeTolerance * removeTolerance;
+
+  const total = width * height;
+  const candidate = new Uint8Array(total);
+  const removed = new Uint8Array(total);
+
+  for (let i = 0; i < total; i++) {
+    const idx = i * 4;
+    const alpha = data[idx + 3];
+    if (alpha < 220) {
+      continue;
+    }
+    const color: RgbColor = { r: data[idx], g: data[idx + 1], b: data[idx + 2] };
+    const x = i % width;
+    const y = (i - x) / width;
+    const expected = predictBgIndex(x, y, checkerPattern);
+    const expectedBg = expected === 0 ? bgA : bgB;
+    if (colorDistanceSq(color, expectedBg) <= removeToleranceSq) {
+      candidate[i] = 1;
+    }
+  }
+
+  const queue: number[] = [];
+  let queueHead = 0;
+  const enqueue = (index: number): void => {
+    if (!candidate[index] || removed[index]) {
+      return;
+    }
+    removed[index] = 1;
+    queue.push(index);
+  };
+
+  for (let x = 0; x < width; x++) {
+    enqueue(x);
+    enqueue((height - 1) * width + x);
+  }
+  for (let y = 1; y < height - 1; y++) {
+    enqueue(y * width);
+    enqueue(y * width + (width - 1));
+  }
+
+  while (queueHead < queue.length) {
+    const index = queue[queueHead++];
+    const x = index % width;
+    const y = (index - x) / width;
+
+    if (x > 0) {
+      enqueue(index - 1);
+    }
+    if (x < width - 1) {
+      enqueue(index + 1);
+    }
+    if (y > 0) {
+      enqueue(index - width);
+    }
+    if (y < height - 1) {
+      enqueue(index + width);
+    }
+  }
+
+  let removedPixels = 0;
+  for (let i = 0; i < total; i++) {
+    if (!removed[i]) {
+      continue;
+    }
+    const idx = i * 4;
+    data[idx] = 0;
+    data[idx + 1] = 0;
+    data[idx + 2] = 0;
+    data[idx + 3] = 0;
+    removedPixels += 1;
+  }
+
+  if (removedPixels === 0) {
+    return null;
+  }
+
+  const EDGE_TOLERANCE = Math.max(removeTolerance + 8, 28);
+  const EDGE_TOLERANCE_SQ = EDGE_TOLERANCE * EDGE_TOLERANCE;
+  let adjustedPixels = 0;
+
+  const hasRemovedNeighbor = (index: number): boolean => {
+    const x = index % width;
+    const y = (index - x) / width;
+    if (x > 0 && removed[index - 1]) {
+      return true;
+    }
+    if (x < width - 1 && removed[index + 1]) {
+      return true;
+    }
+    if (y > 0 && removed[index - width]) {
+      return true;
+    }
+    if (y < height - 1 && removed[index + width]) {
+      return true;
+    }
+    return false;
+  };
+
+  for (let i = 0; i < total; i++) {
+    if (removed[i] || !hasRemovedNeighbor(i)) {
+      continue;
+    }
+
+    const idx = i * 4;
+    const alpha = data[idx + 3];
+    if (alpha === 0) {
+      continue;
+    }
+
+    const src: RgbColor = { r: data[idx], g: data[idx + 1], b: data[idx + 2] };
+    const x = i % width;
+    const y = (i - x) / width;
+    const expected = predictBgIndex(x, y, checkerPattern);
+    const bg = expected === 0 ? bgA : bgB;
+    const d = colorDistanceSq(src, bg);
+    if (d > EDGE_TOLERANCE_SQ) {
+      continue;
+    }
+
+    const estimateAlpha = clamp(Math.sqrt(d) / EDGE_TOLERANCE, 0.04, 1);
+    const currentAlpha = alpha / 255;
+    if (estimateAlpha >= currentAlpha) {
+      continue;
+    }
+
+    const nextAlpha = estimateAlpha;
+    const bgR = bg.r / 255;
+    const bgG = bg.g / 255;
+    const bgBv = bg.b / 255;
+    const srcR = src.r / 255;
+    const srcG = src.g / 255;
+    const srcB = src.b / 255;
+
+    const fgR = clamp((srcR - (1 - nextAlpha) * bgR) / nextAlpha, 0, 1);
+    const fgG = clamp((srcG - (1 - nextAlpha) * bgG) / nextAlpha, 0, 1);
+    const fgB = clamp((srcB - (1 - nextAlpha) * bgBv) / nextAlpha, 0, 1);
+
+    data[idx] = clampByte(fgR * 255);
+    data[idx + 1] = clampByte(fgG * 255);
+    data[idx + 2] = clampByte(fgB * 255);
+    data[idx + 3] = clampByte(nextAlpha * 255);
+    adjustedPixels += 1;
+  }
+
+  cctx.putImageData(imageData, 0, 0);
+  return {
+    removedPixels,
+    adjustedPixels,
   };
 }
 
@@ -488,6 +1051,76 @@ function selectedLayersByOrder(): Layer[] {
   return state.layers.filter((layer) => state.selectedLayerIds.has(layer.id));
 }
 
+function getActiveCropSlice(): CropSelectionSlice | null {
+  const active = state.activeLayerId !== null ? getLayerById(state.activeLayerId) : null;
+  if (!active || !state.cropRect || state.cropRect.w < 1 || state.cropRect.h < 1) {
+    return null;
+  }
+
+  const left = Math.max(state.cropRect.x, active.x);
+  const top = Math.max(state.cropRect.y, active.y);
+  const right = Math.min(state.cropRect.x + state.cropRect.w, active.x + active.width);
+  const bottom = Math.min(state.cropRect.y + state.cropRect.h, active.y + active.height);
+  if (right <= left || bottom <= top) {
+    return null;
+  }
+
+  const sx = clamp(Math.floor(left - active.x), 0, active.width);
+  const sy = clamp(Math.floor(top - active.y), 0, active.height);
+  const ex = clamp(Math.ceil(right - active.x), 0, active.width);
+  const ey = clamp(Math.ceil(bottom - active.y), 0, active.height);
+  const sw = ex - sx;
+  const sh = ey - sy;
+  if (sw <= 0 || sh <= 0) {
+    return null;
+  }
+
+  return {
+    layer: active,
+    sx,
+    sy,
+    sw,
+    sh,
+    worldX: active.x + sx,
+    worldY: active.y + sy,
+  };
+}
+
+function cloneCanvasImage(source: HTMLCanvasElement): HTMLCanvasElement | null {
+  const out = document.createElement("canvas");
+  out.width = source.width;
+  out.height = source.height;
+  const octx = out.getContext("2d");
+  if (!octx) {
+    return null;
+  }
+  octx.drawImage(source, 0, 0);
+  return out;
+}
+
+function eraseActiveLayerCropContent(): boolean {
+  const slice = getActiveCropSlice();
+  if (!slice) {
+    return false;
+  }
+
+  const canvas = layerToEditableCanvas(slice.layer);
+  if (!canvas) {
+    setStatus("删除失败：图层不可编辑");
+    return false;
+  }
+  const cctx = canvas.getContext("2d");
+  if (!cctx) {
+    setStatus("删除失败：2D 上下文不可用");
+    return false;
+  }
+
+  cctx.clearRect(slice.sx, slice.sy, slice.sw, slice.sh);
+  render();
+  setStatus(`已删除框选内容: ${slice.sw}x${slice.sh}`);
+  return true;
+}
+
 function isTypingTarget(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) {
     return false;
@@ -697,8 +1330,20 @@ function triggerShortcutAction(action: ShortcutAction): void {
     createLayerBtn.click();
     return;
   }
+  if (action === "copyCropSelection") {
+    copyCropBtn.click();
+    return;
+  }
+  if (action === "pasteCropSelection") {
+    pasteCropBtn.click();
+    return;
+  }
   if (action === "setPresetCropRect") {
     setCropRectBtn.click();
+    return;
+  }
+  if (action === "removeFakePngBg") {
+    removeFakeBgBtn.click();
     return;
   }
   if (action === "spreadLayers") {
@@ -773,7 +1418,10 @@ function refreshActionButtonLabels(): void {
   cropModeBtn.textContent = `${state.cropMode ? "结束框选" : "开始框选"} (${shortcutText("toggleCropMode")})`;
   clearCropBtn.textContent = `清除框选 (${shortcutText("clearCrop")})`;
   createLayerBtn.textContent = `从框选生成新图层 (${shortcutText("createLayerFromCrop")})`;
+  copyCropBtn.textContent = `复制框选内容 (${shortcutText("copyCropSelection")} / Cmd+C)`;
+  pasteCropBtn.textContent = `粘贴为新图层 (${shortcutText("pasteCropSelection")} / Cmd+V)`;
   setCropRectBtn.textContent = `一键创建框选 (${shortcutText("setPresetCropRect")})`;
+  removeFakeBgBtn.textContent = `去除仿PNG背景（选中优先） (${shortcutText("removeFakePngBg")})`;
   spreadBtn.textContent = `自动散开图层（选中优先） (${shortcutText("spreadLayers")})`;
   alignHBtn.textContent = `选中图层横向排列 (${shortcutText("alignHorizontal")})`;
   alignVBtn.textContent = `选中图层纵向排列 (${shortcutText("alignVertical")})`;
@@ -898,6 +1546,118 @@ setCropRectBtn.addEventListener("click", () => {
   setStatus(`已创建框选: ${Math.round(presetW)} x ${Math.round(presetH)} px`);
 });
 
+copyCropBtn.addEventListener("click", () => {
+  if (state.activeLayerId === null) {
+    setStatus("请先选中一个活动图层");
+    return;
+  }
+  if (!state.cropRect || state.cropRect.w < 1 || state.cropRect.h < 1) {
+    setStatus("请先框选区域");
+    return;
+  }
+
+  const slice = getActiveCropSlice();
+  if (!slice) {
+    setStatus("框选区域没有覆盖到活动图层");
+    return;
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.width = slice.sw;
+  canvas.height = slice.sh;
+  const cctx = canvas.getContext("2d");
+  if (!cctx) {
+    setStatus("复制失败：2D 上下文不可用");
+    return;
+  }
+
+  cctx.clearRect(0, 0, slice.sw, slice.sh);
+  cctx.drawImage(slice.layer.image, slice.sx, slice.sy, slice.sw, slice.sh, 0, 0, slice.sw, slice.sh);
+  state.clipboardImage = canvas;
+  state.clipboardPasteCursor = { x: slice.worldX, y: slice.worldY };
+  setStatus(`已复制框选内容: ${slice.sw}x${slice.sh}`);
+});
+
+pasteCropBtn.addEventListener("click", () => {
+  if (!state.clipboardImage) {
+    setStatus("剪贴板为空，请先复制框选内容");
+    return;
+  }
+
+  const pastedImage = cloneCanvasImage(state.clipboardImage);
+  if (!pastedImage) {
+    setStatus("粘贴失败：2D 上下文不可用");
+    return;
+  }
+
+  let pasteX = screenToWorld({ x: 16, y: 16 }).x;
+  let pasteY = screenToWorld({ x: 16, y: 16 }).y;
+  if (state.cropRect) {
+    pasteX = state.cropRect.x;
+    pasteY = state.cropRect.y;
+  } else if (state.clipboardPasteCursor) {
+    pasteX = state.clipboardPasteCursor.x;
+    pasteY = state.clipboardPasteCursor.y;
+  } else if (state.activeLayerId !== null) {
+    const active = getLayerById(state.activeLayerId);
+    if (active) {
+      pasteX = active.x + 24;
+      pasteY = active.y + 24;
+    }
+  }
+
+  const id = state.nextLayerId++;
+  const newLayer: Layer = {
+    id,
+    name: `pasted-${pastedImage.width}x${pastedImage.height}#${id}`,
+    image: pastedImage,
+    width: pastedImage.width,
+    height: pastedImage.height,
+    x: Math.round(pasteX),
+    y: Math.round(pasteY),
+  };
+
+  state.layers.push(newLayer);
+  state.activeLayerId = id;
+  state.selectedLayerIds.clear();
+  state.selectedLayerIds.add(id);
+  state.clipboardPasteCursor = { x: newLayer.x + 16, y: newLayer.y + 16 };
+
+  refreshLayerList();
+  render();
+  setStatus(`已粘贴新图层: ${newLayer.name}`);
+});
+
+removeFakeBgBtn.addEventListener("click", () => {
+  const selected = selectedLayersByOrder();
+  const targets = selected.length > 0 ? selected : state.layers;
+  if (targets.length === 0) {
+    setStatus("没有可处理的图层");
+    return;
+  }
+
+  let processed = 0;
+  let removedPixels = 0;
+  let adjustedPixels = 0;
+  for (const layer of targets) {
+    const result = removeFakeCheckerBackground(layer);
+    if (!result) {
+      continue;
+    }
+    processed += 1;
+    removedPixels += result.removedPixels;
+    adjustedPixels += result.adjustedPixels;
+  }
+
+  if (processed === 0) {
+    setStatus("未检测到可去除的仿 PNG 棋盘背景");
+    return;
+  }
+
+  render();
+  setStatus(`已处理 ${processed}/${targets.length} 个图层：去除 ${removedPixels} 像素，修复边缘 ${adjustedPixels} 像素`);
+});
+
 resetShortcutBtn.addEventListener("click", () => {
   state.shortcutMap = defaultShortcutMap();
   state.capturingShortcutFor = null;
@@ -963,9 +1723,10 @@ stage.addEventListener("mousedown", (event: MouseEvent) => {
   }
 
   const hitSelectedBefore = state.selectedLayerIds.has(hit.id);
+  const toggleMultiSelect = event.shiftKey || event.altKey;
   state.activeLayerId = hit.id;
 
-  if (event.shiftKey) {
+  if (toggleMultiSelect) {
     if (state.selectedLayerIds.has(hit.id)) {
       state.selectedLayerIds.delete(hit.id);
     } else {
@@ -1270,6 +2031,36 @@ window.addEventListener("keydown", (event: KeyboardEvent) => {
     const label = def ? def.label : editingAction;
     setStatus(`快捷键已更新：${label} -> ${normalizeShortcutString(shortcut)}`);
     return;
+  }
+
+  if (!typing && (event.ctrlKey || event.metaKey) && !event.altKey) {
+    const lowerKey = event.key.toLowerCase();
+    if (lowerKey === "c") {
+      event.preventDefault();
+      copyCropBtn.click();
+      return;
+    }
+    if (lowerKey === "v") {
+      event.preventDefault();
+      pasteCropBtn.click();
+      return;
+    }
+  }
+
+  if (!typing && event.key === "Backspace") {
+    event.preventDefault();
+    const hasCrop = Boolean(state.cropRect && state.cropRect.w > 0 && state.cropRect.h > 0);
+    if (hasCrop) {
+      if (eraseActiveLayerCropContent()) {
+        return;
+      }
+      setStatus("框选区域未覆盖活动图层，已取消删除");
+      return;
+    }
+    if (state.selectedLayerIds.size > 0) {
+      deleteBtn.click();
+      return;
+    }
   }
 
   if (!typing && shortcut) {
