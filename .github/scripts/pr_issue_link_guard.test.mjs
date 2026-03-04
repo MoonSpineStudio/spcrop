@@ -9,12 +9,12 @@ test('accepts closes keyword with local issue number', () => {
 });
 
 test('accepts closes keyword with cross-repo issue', () => {
-  assert.equal(hasLinkedIssue('Closes kafkalm/rougeflipper#88'), true);
+  assert.equal(hasLinkedIssue('Closes MoonSpineStudio/rougeflipper#88'), true);
 });
 
 test('accepts issue url in body', () => {
   assert.equal(
-    hasLinkedIssue('Tracking issue: https://github.com/kafkalm/rougeflipper/issues/42'),
+    hasLinkedIssue('Tracking issue: https://github.com/MoonSpineStudio/rougeflipper/issues/42'),
     true,
   );
 });
