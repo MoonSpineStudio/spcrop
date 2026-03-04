@@ -1,4 +1,4 @@
-export type ProviderId = "openai" | "gemini";
+export type ProviderId = "openai" | "gemini" | "openrouter";
 
 export type GenerationMode = "text_to_image" | "image_to_image";
 
@@ -55,6 +55,7 @@ export interface ProviderAdapter {
 export interface ProviderAdapterMap {
   openai: ProviderAdapter;
   gemini: ProviderAdapter;
+  openrouter: ProviderAdapter;
 }
 
 export interface RunWithFallbackResult {
@@ -70,6 +71,9 @@ export interface AiSettings {
   geminiApiKey: string;
   geminiBaseUrl: string;
   geminiModel: string;
+  openrouterApiKey: string;
+  openrouterBaseUrl: string;
+  openrouterModel: string;
   enableFallback: boolean;
   fallbackProvider: "" | ProviderId;
   outputCount: number;
