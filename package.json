@@ -13,5 +13,10 @@
     "typescript": "^5.9.2",
     "vite": "^7.1.5",
     "vitest": "^4.0.18"
+  },
+  "dependencies": {
+    "@google/genai": "^1.43.0",
+    "@openrouter/sdk": "^0.9.11",
+    "openai": "^6.25.0"
   }
 }

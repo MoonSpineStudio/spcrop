@@ -1,3 +1,5 @@
+import { GoogleGenAI, Modality } from "@google/genai";
+
 import { makeGeneratedAsset } from "../image-utils";
 import type { GenerateRequest, ProviderAdapter } from "../types";
 
@@ -14,8 +16,28 @@ interface GeminiPart {
   };
 }
 
-function normalizeBaseUrl(baseUrl: string): string {
-  return baseUrl.replace(/\/$/, "");
+interface GeminiBaseUrlConfig {
+  baseUrl?: string;
+  apiVersion?: string;
+}
+
+const GEMINI_VERSION_SUFFIX_RE = /\/(v1alpha|v1beta|v1)$/i;
+
+export function normalizeGeminiBaseUrl(baseUrl: string): GeminiBaseUrlConfig {
+  const trimmed = (baseUrl || "").trim();
+  const noTrailingSlash = trimmed.replace(/\/+$/, "");
+  if (!noTrailingSlash) {
+    return {};
+  }
+  const versionMatch = noTrailingSlash.match(GEMINI_VERSION_SUFFIX_RE);
+  if (!versionMatch) {
+    return { baseUrl: noTrailingSlash };
+  }
+  const normalizedBaseUrl = noTrailingSlash.replace(GEMINI_VERSION_SUFFIX_RE, "");
+  return {
+    baseUrl: normalizedBaseUrl,
+    apiVersion: versionMatch[1].toLowerCase(),
+  };
 }
 
 function b64ToBlob(base64: string, mimeType: string): Blob {
@@ -27,18 +49,26 @@ function b64ToBlob(base64: string, mimeType: string): Blob {
   return new Blob([bytes], { type: mimeType });
 }
 
-async function ensureOk(response: Response): Promise<void> {
-  if (response.ok) {
-    return;
+async function blobToBase64(blob: Blob): Promise<string> {
+  const data = await blob.arrayBuffer();
+  const bytes = new Uint8Array(data);
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
   }
-  let detail = "";
-  try {
-    const json = (await response.json()) as { error?: { message?: string } };
-    detail = json.error?.message ? `: ${json.error.message}` : "";
-  } catch {
-    // Ignore parsing failure.
+  return btoa(binary);
+}
+
+function toGeminiError(error: unknown): Error {
+  if (error && typeof error === "object" && "status" in error) {
+    const status = String((error as { status?: unknown }).status ?? "unknown");
+    const message = String((error as { message?: unknown }).message ?? "request failed");
+    return new Error(`Gemini request failed (${status}): ${message}`);
   }
-  throw new Error(`Gemini request failed (${response.status})${detail}`);
+  if (error instanceof Error) {
+    return new Error(`Gemini request failed: ${error.message}`);
+  }
+  return new Error("Gemini request failed");
 }
 
 function buildPromptText(req: GenerateRequest): string {
@@ -52,13 +82,21 @@ export function createGeminiAdapter(getConfig: () => GeminiConfig): ProviderAdap
   return {
     async generate(req: GenerateRequest, signal?: AbortSignal) {
       const config = getConfig();
-      if (!config.apiKey.trim()) {
+      const apiKey = config.apiKey.trim();
+      if (!apiKey) {
         throw new Error("Missing Gemini API key");
       }
 
-      const baseUrl = normalizeBaseUrl(config.baseUrl || "https://generativelanguage.googleapis.com");
-      const model = req.model;
-      const apiUrl = `${baseUrl}/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(config.apiKey)}`;
+      const base = normalizeGeminiBaseUrl(config.baseUrl);
+      const client = new GoogleGenAI({
+        apiKey,
+        apiVersion: base.apiVersion,
+        httpOptions: base.baseUrl
+          ? {
+            baseUrl: base.baseUrl,
+          }
+          : undefined,
+      });
 
       const parts: GeminiPart[] = [
         {
@@ -70,65 +108,52 @@ export function createGeminiAdapter(getConfig: () => GeminiConfig): ProviderAdap
         if (!req.imageSource) {
           throw new Error("Image source is required for image-to-image mode");
         }
-        const data = await req.imageSource.blob.arrayBuffer();
-        const bytes = new Uint8Array(data);
-        let binary = "";
-        for (const byte of bytes) {
-          binary += String.fromCharCode(byte);
-        }
         parts.push({
           inlineData: {
             mimeType: req.imageSource.mimeType || "image/png",
-            data: btoa(binary),
+            data: await blobToBase64(req.imageSource.blob),
           },
         });
       }
 
-      const response = await fetch(apiUrl, {
-        method: "POST",
-        signal,
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
+      try {
+        const payload = await client.models.generateContent({
+          model: req.model,
           contents: [
             {
               role: "user",
               parts,
             },
           ],
-          generationConfig: {
-            responseModalities: ["TEXT", "IMAGE"],
+          config: {
+            responseModalities: [Modality.TEXT, Modality.IMAGE],
             candidateCount: Math.max(1, req.outputCount),
+            abortSignal: signal,
           },
-        }),
-      });
+        });
 
-      await ensureOk(response);
-
-      const payload = (await response.json()) as {
-        candidates?: Array<{ content?: { parts?: GeminiPart[] } }>;
-      };
-
-      const blobs: Blob[] = [];
-      for (const candidate of payload.candidates ?? []) {
-        for (const part of candidate.content?.parts ?? []) {
-          if (part.inlineData?.data) {
-            blobs.push(b64ToBlob(part.inlineData.data, part.inlineData.mimeType || "image/png"));
+        const blobs: Blob[] = [];
+        for (const candidate of payload.candidates ?? []) {
+          for (const part of candidate.content?.parts ?? []) {
+            if (part.inlineData?.data) {
+              blobs.push(b64ToBlob(part.inlineData.data, part.inlineData.mimeType || "image/png"));
+            }
           }
         }
-      }
 
-      if (blobs.length === 0) {
-        throw new Error("Gemini returned no images");
-      }
+        if (blobs.length === 0) {
+          throw new Error("Gemini returned no images");
+        }
 
-      const assets = [];
-      for (const blob of blobs) {
-        // eslint-disable-next-line no-await-in-loop
-        assets.push(await makeGeneratedAsset(blob));
+        const assets = [];
+        for (const blob of blobs) {
+          // eslint-disable-next-line no-await-in-loop
+          assets.push(await makeGeneratedAsset(blob));
+        }
+        return assets;
+      } catch (error) {
+        throw toGeminiError(error);
       }
-      return assets;
     },
   };
 }

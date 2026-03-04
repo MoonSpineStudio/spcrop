@@ -1,3 +1,5 @@
+import OpenAI, { APIError } from "openai";
+
 import { makeGeneratedAsset } from "../image-utils";
 import type { GenerateRequest, ProviderAdapter } from "../types";
 
@@ -9,22 +11,23 @@ export interface OpenAIConfig {
 export function normalizeOpenAIBaseUrl(baseUrl: string): string {
   const trimmed = (baseUrl || "https://api.openai.com").trim();
   const noTrailingSlash = trimmed.replace(/\/+$/, "");
-  const noVersionSuffix = noTrailingSlash.replace(/\/v1$/i, "");
-  return noVersionSuffix || "https://api.openai.com";
+  if (!noTrailingSlash) {
+    return "https://api.openai.com/v1";
+  }
+  if (/\/v1$/i.test(noTrailingSlash)) {
+    return noTrailingSlash;
+  }
+  return `${noTrailingSlash}/v1`;
 }
 
-async function ensureOk(response: Response): Promise<void> {
-  if (response.ok) {
-    return;
+function toOpenAIError(error: unknown): Error {
+  if (error instanceof APIError) {
+    return new Error(`OpenAI request failed (${error.status ?? "unknown"}): ${error.message}`);
   }
-  let detail = "";
-  try {
-    const json = (await response.json()) as { error?: { message?: string } };
-    detail = json.error?.message ? `: ${json.error.message}` : "";
-  } catch {
-    // Ignore parsing failure.
+  if (error instanceof Error) {
+    return new Error(`OpenAI request failed: ${error.message}`);
   }
-  throw new Error(`OpenAI request failed (${response.status})${detail}`);
+  return new Error("OpenAI request failed");
 }
 
 function b64ToBlob(base64: string, mimeType: string): Blob {
@@ -36,7 +39,7 @@ function b64ToBlob(base64: string, mimeType: string): Blob {
   return new Blob([bytes], { type: mimeType });
 }
 
-async function responseDataToAssets(data: Array<{ b64_json?: string; url?: string }>): Promise<Blob[]> {
+async function responseDataToAssets(data: Array<{ b64_json?: string | null; url?: string | null }>): Promise<Blob[]> {
   const blobs: Blob[] = [];
   for (const item of data) {
     if (item.b64_json) {
@@ -46,7 +49,7 @@ async function responseDataToAssets(data: Array<{ b64_json?: string; url?: strin
     if (item.url) {
       const fetched = await fetch(item.url);
       if (!fetched.ok) {
-        throw new Error("OpenAI image URL download failed");
+        throw new Error(`OpenAI image URL download failed (${fetched.status})`);
       }
       blobs.push(await fetched.blob());
     }
@@ -58,37 +61,66 @@ export function createOpenAIAdapter(getConfig: () => OpenAIConfig): ProviderAdap
   return {
     async generate(req: GenerateRequest, signal?: AbortSignal) {
       const config = getConfig();
-      if (!config.apiKey.trim()) {
+      const apiKey = config.apiKey.trim();
+      if (!apiKey) {
         throw new Error("Missing OpenAI API key");
       }
 
-      const headers = {
-        Authorization: `Bearer ${config.apiKey}`,
-      };
+      const client = new OpenAI({
+        apiKey,
+        baseURL: normalizeOpenAIBaseUrl(config.baseUrl || "https://api.openai.com"),
+        dangerouslyAllowBrowser: true,
+      });
 
-      const baseUrl = normalizeOpenAIBaseUrl(config.baseUrl || "https://api.openai.com");
+      const prompt = req.negativePrompt
+        ? `${req.prompt}\n\nNegative prompt: ${req.negativePrompt}`
+        : req.prompt;
 
-      if (req.mode === "text_to_image") {
-        const response = await fetch(`${baseUrl}/v1/images/generations`, {
-          method: "POST",
-          signal,
-          headers: {
-            ...headers,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
+      try {
+        if (req.mode === "text_to_image") {
+          const response = await client.images.generate({
             model: req.model,
-            prompt: req.negativePrompt
-              ? `${req.prompt}\n\nNegative prompt: ${req.negativePrompt}`
-              : req.prompt,
+            prompt,
             n: Math.max(1, req.outputCount),
             response_format: "b64_json",
-          }),
+          }, {
+            signal,
+          });
+
+          const blobs = await responseDataToAssets(response.data ?? []);
+          if (blobs.length === 0) {
+            throw new Error("OpenAI returned no images");
+          }
+          const assets = [];
+          for (const blob of blobs) {
+            // eslint-disable-next-line no-await-in-loop
+            assets.push(await makeGeneratedAsset(blob));
+          }
+          return assets;
+        }
+
+        if (!req.imageSource) {
+          throw new Error("Image source is required for image-to-image mode");
+        }
+
+        const source = new File(
+          [req.imageSource.blob],
+          req.imageSource.name || "source.png",
+          {
+            type: req.imageSource.mimeType || req.imageSource.blob.type || "image/png",
+          },
+        );
+        const response = await client.images.edit({
+          model: req.model,
+          prompt,
+          n: Math.max(1, req.outputCount),
+          response_format: "b64_json",
+          image: source,
+        }, {
+          signal,
         });
 
-        await ensureOk(response);
-        const payload = (await response.json()) as { data?: Array<{ b64_json?: string; url?: string }> };
-        const blobs = await responseDataToAssets(payload.data ?? []);
+        const blobs = await responseDataToAssets(response.data ?? []);
         if (blobs.length === 0) {
           throw new Error("OpenAI returned no images");
         }
@@ -98,41 +130,9 @@ export function createOpenAIAdapter(getConfig: () => OpenAIConfig): ProviderAdap
           assets.push(await makeGeneratedAsset(blob));
         }
         return assets;
+      } catch (error) {
+        throw toOpenAIError(error);
       }
-
-      if (!req.imageSource) {
-        throw new Error("Image source is required for image-to-image mode");
-      }
-
-      const formData = new FormData();
-      formData.append("model", req.model);
-      formData.append(
-        "prompt",
-        req.negativePrompt ? `${req.prompt}\n\nNegative prompt: ${req.negativePrompt}` : req.prompt,
-      );
-      formData.append("n", String(Math.max(1, req.outputCount)));
-      formData.append("response_format", "b64_json");
-      formData.append("image", req.imageSource.blob, req.imageSource.name || "source.png");
-
-      const response = await fetch(`${baseUrl}/v1/images/edits`, {
-        method: "POST",
-        signal,
-        headers,
-        body: formData,
-      });
-
-      await ensureOk(response);
-      const payload = (await response.json()) as { data?: Array<{ b64_json?: string; url?: string }> };
-      const blobs = await responseDataToAssets(payload.data ?? []);
-      if (blobs.length === 0) {
-        throw new Error("OpenAI returned no images");
-      }
-      const assets = [];
-      for (const blob of blobs) {
-        // eslint-disable-next-line no-await-in-loop
-        assets.push(await makeGeneratedAsset(blob));
-      }
-      return assets;
     },
   };
 }

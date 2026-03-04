@@ -1,10 +1,14 @@
 import type { ProviderAdapterMap, RunWithFallbackResult, GenerateRequest, ProviderId } from "./types";
 
 function getAdapter(provider: ProviderId, adapters: ProviderAdapterMap) {
-  if (provider === "openai") {
-    return adapters.openai;
+  switch (provider) {
+    case "openai":
+      return adapters.openai;
+    case "gemini":
+      return adapters.gemini;
+    default:
+      return adapters.openrouter;
   }
-  return adapters.gemini;
 }
 
 export async function runWithFallback(

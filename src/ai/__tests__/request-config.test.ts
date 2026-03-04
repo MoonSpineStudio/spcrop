@@ -23,6 +23,16 @@ describe("resolveFallbackProvider", () => {
     expect(fallback).toBe("gemini");
   });
 
+  it("supports openrouter as explicit fallback provider", () => {
+    const fallback = resolveFallbackProvider({
+      primaryProvider: "gemini",
+      enableFallback: true,
+      fallbackProvider: "openrouter",
+    });
+
+    expect(fallback).toBe("openrouter");
+  });
+
   it("returns undefined when fallback is disabled", () => {
     const fallback = resolveFallbackProvider({
       primaryProvider: "openai",

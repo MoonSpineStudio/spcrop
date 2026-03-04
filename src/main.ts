@@ -22,6 +22,7 @@ import { resolveFallbackProvider } from "./ai/request-config";
 import { createTaskRecord, patchTaskRecord } from "./ai/task-store";
 import { createGeminiAdapter } from "./ai/providers/gemini";
 import { createOpenAIAdapter } from "./ai/providers/openai";
+import { createOpenRouterAdapter } from "./ai/providers/openrouter";
 import type {
   AiSettings,
   GalleryItem,
@@ -126,6 +127,9 @@ const DEFAULT_AI_SETTINGS: AiSettings = {
   geminiApiKey: "",
   geminiBaseUrl: "https://generativelanguage.googleapis.com",
   geminiModel: "gemini-2.5-flash-image-preview",
+  openrouterApiKey: "",
+  openrouterBaseUrl: "https://openrouter.ai/api/v1",
+  openrouterModel: "openai/gpt-5-image",
   enableFallback: true,
   fallbackProvider: "",
   outputCount: 1,
@@ -249,6 +253,9 @@ const openaiModelInput = mustGet<HTMLInputElement>("openaiModel");
 const geminiApiKeyInput = mustGet<HTMLInputElement>("geminiApiKey");
 const geminiBaseUrlInput = mustGet<HTMLInputElement>("geminiBaseUrl");
 const geminiModelInput = mustGet<HTMLInputElement>("geminiModel");
+const openrouterApiKeyInput = mustGet<HTMLInputElement>("openrouterApiKey");
+const openrouterBaseUrlInput = mustGet<HTMLInputElement>("openrouterBaseUrl");
+const openrouterModelInput = mustGet<HTMLInputElement>("openrouterModel");
 const aiOutputCountInput = mustGet<HTMLInputElement>("aiOutputCount");
 const enableFallbackInput = mustGet<HTMLInputElement>("enableFallback");
 const fallbackProviderSelect = mustGet<HTMLSelectElement>("fallbackProvider");
@@ -1533,7 +1540,7 @@ function downloadBlob(blob: Blob, filename: string): void {
 }
 
 function isProviderId(value: string): value is ProviderId {
-  return value === "openai" || value === "gemini";
+  return value === "openai" || value === "gemini" || value === "openrouter";
 }
 
 function isGenerationMode(value: string): value is GenerationMode {
@@ -1556,7 +1563,7 @@ function loadAiSettings(): void {
       ...DEFAULT_AI_SETTINGS,
       ...parsed,
       outputCount: clamp(Number(parsed.outputCount ?? DEFAULT_AI_SETTINGS.outputCount), 1, 4),
-      fallbackProvider: parsed.fallbackProvider === "openai" || parsed.fallbackProvider === "gemini"
+      fallbackProvider: parsed.fallbackProvider === "openai" || parsed.fallbackProvider === "gemini" || parsed.fallbackProvider === "openrouter"
         ? parsed.fallbackProvider
         : "",
     };
@@ -1580,6 +1587,9 @@ function syncAiSettingsToUI(): void {
   geminiApiKeyInput.value = aiState.settings.geminiApiKey;
   geminiBaseUrlInput.value = aiState.settings.geminiBaseUrl;
   geminiModelInput.value = aiState.settings.geminiModel;
+  openrouterApiKeyInput.value = aiState.settings.openrouterApiKey;
+  openrouterBaseUrlInput.value = aiState.settings.openrouterBaseUrl;
+  openrouterModelInput.value = aiState.settings.openrouterModel;
   aiOutputCountInput.value = String(aiState.settings.outputCount);
   enableFallbackInput.checked = aiState.settings.enableFallback;
   fallbackProviderSelect.value = aiState.settings.fallbackProvider;
@@ -1592,6 +1602,9 @@ function syncAiSettingsFromUI(): void {
   aiState.settings.geminiApiKey = geminiApiKeyInput.value.trim();
   aiState.settings.geminiBaseUrl = geminiBaseUrlInput.value.trim() || DEFAULT_AI_SETTINGS.geminiBaseUrl;
   aiState.settings.geminiModel = geminiModelInput.value.trim() || DEFAULT_AI_SETTINGS.geminiModel;
+  aiState.settings.openrouterApiKey = openrouterApiKeyInput.value.trim();
+  aiState.settings.openrouterBaseUrl = openrouterBaseUrlInput.value.trim() || DEFAULT_AI_SETTINGS.openrouterBaseUrl;
+  aiState.settings.openrouterModel = openrouterModelInput.value.trim() || DEFAULT_AI_SETTINGS.openrouterModel;
   aiState.settings.outputCount = clamp(Number(aiOutputCountInput.value) || 1, 1, 4);
   aiState.settings.enableFallback = enableFallbackInput.checked;
   const fallbackValue = fallbackProviderSelect.value;
@@ -1634,6 +1647,11 @@ const openaiAdapter = createOpenAIAdapter(() => ({
 const geminiAdapter = createGeminiAdapter(() => ({
   apiKey: aiState.settings.geminiApiKey,
   baseUrl: aiState.settings.geminiBaseUrl,
+}));
+
+const openrouterAdapter = createOpenRouterAdapter(() => ({
+  apiKey: aiState.settings.openrouterApiKey,
+  baseUrl: aiState.settings.openrouterBaseUrl,
 }));
 
 function refreshOutputDirStatus(): void {
@@ -1920,7 +1938,11 @@ async function createGenerateRequestFromUI(): Promise<GenerateRequest> {
     imageSource = await resolveImageSource(sourceKind);
   }
 
-  const model = provider === "openai" ? aiState.settings.openaiModel : aiState.settings.geminiModel;
+  const model = provider === "openai"
+    ? aiState.settings.openaiModel
+    : provider === "gemini"
+      ? aiState.settings.geminiModel
+      : aiState.settings.openrouterModel;
   const request = makeProviderRequest({
     provider,
     mode,
@@ -1951,7 +1973,11 @@ async function runGenerateTask(request: GenerateRequest): Promise<void> {
   aiState.taskAbortControllers.set(baseTask.id, controller);
 
   try {
-    const result = await runWithFallback(request, { openai: openaiAdapter, gemini: geminiAdapter }, controller.signal);
+    const result = await runWithFallback(
+      request,
+      { openai: openaiAdapter, gemini: geminiAdapter, openrouter: openrouterAdapter },
+      controller.signal,
+    );
     const outputFiles: string[] = [];
     for (let i = 0; i < result.assets.length; i++) {
       const asset = result.assets[i];
@@ -2292,6 +2318,9 @@ aiSourceKindSelect.addEventListener("change", () => {
   geminiApiKeyInput,
   geminiBaseUrlInput,
   geminiModelInput,
+  openrouterApiKeyInput,
+  openrouterBaseUrlInput,
+  openrouterModelInput,
   aiOutputCountInput,
   enableFallbackInput,
   fallbackProviderSelect,
