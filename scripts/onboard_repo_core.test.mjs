@@ -24,7 +24,7 @@ test('normalizeNotionId throws on invalid input', () => {
 });
 
 test('defaultTaskDbName uses repo name suffix', () => {
-  assert.equal(defaultTaskDbName('kafkalm/Bossman'), 'Task Mirror DB - Bossman');
+  assert.equal(defaultTaskDbName('MoonSpineStudio/Bossman'), 'Task Mirror DB - Bossman');
 });
 
 test('buildTaskMirrorProperties contains required keys', () => {
@@ -48,19 +48,19 @@ test('buildTaskMirrorProperties contains required keys', () => {
 });
 
 test('defaultPortfolioTitle uses repo name suffix', () => {
-  assert.equal(defaultPortfolioTitle('kafkalm/rougeflipper'), 'rougeflipper');
+  assert.equal(defaultPortfolioTitle('MoonSpineStudio/rougeflipper'), 'rougeflipper');
 });
 
 test('buildPortfolioProjectProperties creates stable project key row', () => {
   const props = buildPortfolioProjectProperties({
-    repo: 'kafkalm/rougeflipper',
+    repo: 'MoonSpineStudio/rougeflipper',
     syncedAt: '2026-02-27T12:00:00.000Z',
   });
 
   assert.equal(props.Title.title[0].text.content, 'rougeflipper');
-  assert.equal(props['Project Key'].rich_text[0].text.content, 'kafkalm/rougeflipper');
+  assert.equal(props['Project Key'].rich_text[0].text.content, 'MoonSpineStudio/rougeflipper');
   assert.equal(props.Status.select.name, 'Active');
   assert.equal(props.Health, undefined);
-  assert.equal(props['Repository URL'].url, 'https://github.com/kafkalm/rougeflipper');
+  assert.equal(props['Repository URL'].url, 'https://github.com/MoonSpineStudio/rougeflipper');
   assert.equal(props['Last Synced At'].date.start, '2026-02-27T12:00:00.000Z');
 });
