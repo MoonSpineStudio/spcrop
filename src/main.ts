@@ -25,9 +25,10 @@ import { createGeminiAdapter } from "./ai/providers/gemini";
 import { createOpenAIAdapter } from "./ai/providers/openai";
 import { createOpenRouterAdapter } from "./ai/providers/openrouter";
 import {
-  GEMINI_MODEL_PRESET_BY_ID,
+  getProviderModelPresets,
   isImageSourceKind,
   normalizeGeminiModelId,
+  type ProviderModelPreset,
 } from "./ai/ui-options";
 import {
   accumulateRotation,
@@ -194,7 +195,7 @@ const DEFAULT_AI_SETTINGS: AiSettings = {
   preferredSourceKind: "crop",
   openaiApiKey: "",
   openaiBaseUrl: "https://api.openai.com",
-  openaiModel: "gpt-image-1",
+  openaiModel: "gpt-image-1.5",
   geminiApiKey: "",
   geminiBaseUrl: "https://generativelanguage.googleapis.com",
   geminiModel: "gemini-2.5-flash-image",
@@ -207,12 +208,6 @@ const DEFAULT_AI_SETTINGS: AiSettings = {
 };
 
 const CUSTOM_MODEL_PRESET_ID = "__custom__";
-
-interface ModelPresetOption {
-  id: string;
-  label: string;
-  model: string;
-}
 
 interface AiRuntimeState {
   settings: AiSettings;
@@ -1899,42 +1894,8 @@ function isGenerationMode(value: string): value is GenerationMode {
   return value === "text_to_image" || value === "image_to_image";
 }
 
-function modelPresetsForProvider(provider: ProviderId): ModelPresetOption[] {
-  if (provider === "gemini") {
-    return [
-      {
-        id: "nanobanana",
-        label: "NanoBanana",
-        model: GEMINI_MODEL_PRESET_BY_ID.nanobanana.model,
-      },
-      {
-        id: "nanobanana_pro",
-        label: "NanoBanana Pro",
-        model: GEMINI_MODEL_PRESET_BY_ID.nanobanana_pro.model,
-      },
-      {
-        id: "nanobanana_2",
-        label: "NanoBanana 2",
-        model: GEMINI_MODEL_PRESET_BY_ID.nanobanana_2.model,
-      },
-    ];
-  }
-  if (provider === "openrouter") {
-    return [
-      {
-        id: "openrouter_default",
-        label: "openai/gpt-5-image",
-        model: "openai/gpt-5-image",
-      },
-    ];
-  }
-  return [
-    {
-      id: "openai_default",
-      label: "gpt-image-1",
-      model: "gpt-image-1",
-    },
-  ];
+function modelPresetsForProvider(provider: ProviderId): ProviderModelPreset[] {
+  return getProviderModelPresets(provider);
 }
 
 function getProviderModel(provider: ProviderId): string {
