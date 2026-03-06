@@ -25,6 +25,12 @@ import { createGeminiAdapter } from "./ai/providers/gemini";
 import { createOpenAIAdapter } from "./ai/providers/openai";
 import { createOpenRouterAdapter } from "./ai/providers/openrouter";
 import {
+  GEMINI_MODEL_PRESET_BY_ID,
+  isImageSourceKind,
+  resolveGeminiModelPreset,
+  type GeminiModelPresetId,
+} from "./ai/ui-options";
+import {
   accumulateRotation,
   findRotateHandleIndex,
   getRotatableRectCenter,
@@ -204,6 +210,7 @@ interface AiRuntimeState {
   tasks: TaskRecord[];
   gallery: GalleryItem[];
   selectedSourceKind: ImageSourceKind;
+  uploadedSourceFile: File | null;
   outputDirHandle: FileSystemDirectoryHandle | null;
   outputDirReady: boolean;
   taskAbortControllers: Map<string, AbortController>;
@@ -308,6 +315,9 @@ const resetShortcutBtn = mustGet<HTMLButtonElement>("resetShortcutBtn");
 const aiProviderSelect = mustGet<HTMLSelectElement>("aiProvider");
 const aiModeSelect = mustGet<HTMLSelectElement>("aiMode");
 const aiSourceKindSelect = mustGet<HTMLSelectElement>("aiSourceKind");
+const aiUploadFileRow = mustGet<HTMLDivElement>("aiUploadFileRow");
+const aiUploadFileInput = mustGet<HTMLInputElement>("aiUploadFile");
+const aiUploadFileName = mustGet<HTMLDivElement>("aiUploadFileName");
 const aiPromptInput = mustGet<HTMLTextAreaElement>("aiPrompt");
 const aiNegativePromptInput = mustGet<HTMLTextAreaElement>("aiNegativePrompt");
 const generateAiBtn = mustGet<HTMLButtonElement>("generateAiBtn");
@@ -323,6 +333,7 @@ const openaiBaseUrlInput = mustGet<HTMLInputElement>("openaiBaseUrl");
 const openaiModelInput = mustGet<HTMLInputElement>("openaiModel");
 const geminiApiKeyInput = mustGet<HTMLInputElement>("geminiApiKey");
 const geminiBaseUrlInput = mustGet<HTMLInputElement>("geminiBaseUrl");
+const geminiModelPresetSelect = mustGet<HTMLSelectElement>("geminiModelPreset");
 const geminiModelInput = mustGet<HTMLInputElement>("geminiModel");
 const openrouterApiKeyInput = mustGet<HTMLInputElement>("openrouterApiKey");
 const openrouterBaseUrlInput = mustGet<HTMLInputElement>("openrouterBaseUrl");
@@ -376,6 +387,7 @@ const aiState: AiRuntimeState = {
   tasks: [],
   gallery: [],
   selectedSourceKind: "crop",
+  uploadedSourceFile: null,
   outputDirHandle: null,
   outputDirReady: false,
   taskAbortControllers: new Map<string, AbortController>(),
@@ -1879,10 +1891,6 @@ function isGenerationMode(value: string): value is GenerationMode {
   return value === "text_to_image" || value === "image_to_image";
 }
 
-function isImageSourceKind(value: string): value is ImageSourceKind {
-  return value === "crop" || value === "active_layer" || value === "gallery_item";
-}
-
 function loadAiSettings(): void {
   try {
     const raw = window.localStorage.getItem(AI_SETTINGS_STORAGE_KEY);
@@ -1926,6 +1934,7 @@ function syncAiSettingsToUI(): void {
   geminiApiKeyInput.value = aiState.settings.geminiApiKey;
   geminiBaseUrlInput.value = aiState.settings.geminiBaseUrl;
   geminiModelInput.value = aiState.settings.geminiModel;
+  geminiModelPresetSelect.value = resolveGeminiModelPreset(aiState.settings.geminiModel);
   openrouterApiKeyInput.value = aiState.settings.openrouterApiKey;
   openrouterBaseUrlInput.value = aiState.settings.openrouterBaseUrl;
   openrouterModelInput.value = aiState.settings.openrouterModel;
@@ -1942,6 +1951,7 @@ function syncAiSettingsFromUI(): void {
   aiState.settings.geminiApiKey = geminiApiKeyInput.value.trim();
   aiState.settings.geminiBaseUrl = geminiBaseUrlInput.value.trim() || DEFAULT_AI_SETTINGS.geminiBaseUrl;
   aiState.settings.geminiModel = geminiModelInput.value.trim() || DEFAULT_AI_SETTINGS.geminiModel;
+  geminiModelPresetSelect.value = resolveGeminiModelPreset(aiState.settings.geminiModel);
   aiState.settings.openrouterApiKey = openrouterApiKeyInput.value.trim();
   aiState.settings.openrouterBaseUrl = openrouterBaseUrlInput.value.trim() || DEFAULT_AI_SETTINGS.openrouterBaseUrl;
   aiState.settings.openrouterModel = openrouterModelInput.value.trim() || DEFAULT_AI_SETTINGS.openrouterModel;
@@ -1965,6 +1975,20 @@ function getActiveMode(): GenerationMode {
 function getSelectedSourceKind(): ImageSourceKind {
   const raw = aiSourceKindSelect.value;
   return isImageSourceKind(raw) ? raw : "crop";
+}
+
+function setUploadedSourceFile(file: File | null): void {
+  aiState.uploadedSourceFile = file;
+  aiUploadFileName.textContent = file ? `已选择：${file.name}` : "未选择文件";
+}
+
+function syncAiSourceControls(): void {
+  const imageMode = getActiveMode() === "image_to_image";
+  aiSourceKindSelect.disabled = !imageMode;
+  const sourceKind = getSelectedSourceKind();
+  const showUpload = imageMode && sourceKind === "uploaded_file";
+  aiUploadFileRow.hidden = !showUpload;
+  aiUploadFileInput.disabled = !showUpload;
 }
 
 function makeProviderRequest(req: GenerateRequest): GenerateRequest {
@@ -2066,6 +2090,11 @@ function renderAiTaskList(): void {
         aiPromptInput.value = task.prompt;
         aiModeSelect.value = task.mode;
         aiProviderSelect.value = task.provider;
+        if (task.imageSourceKind && isImageSourceKind(task.imageSourceKind)) {
+          aiSourceKindSelect.value = task.imageSourceKind;
+          aiState.selectedSourceKind = task.imageSourceKind;
+        }
+        syncAiSourceControls();
         generateAiBtn.click();
       });
       actions.appendChild(retryBtn);
@@ -2139,6 +2168,7 @@ function renderAiGallery(): void {
       aiState.gallery = markSelectedSource(aiState.gallery, item.id);
       aiSourceKindSelect.value = "gallery_item";
       aiState.selectedSourceKind = "gallery_item";
+      syncAiSourceControls();
       renderAiGallery();
       persistAiHistory();
       setStatus("已设置素材来源：候选区选中图");
@@ -2216,6 +2246,17 @@ async function resolveImageSource(kind: ImageSourceKind): Promise<ImageInput> {
     }
     const blob = await canvasToPngBlob(rendered);
     return buildImageInput("active_layer", blob, "active-layer.png");
+  }
+
+  if (kind === "uploaded_file") {
+    const file = aiState.uploadedSourceFile;
+    if (!file) {
+      throw new Error("请先上传图生图来源文件");
+    }
+    if (!file.type.startsWith("image/")) {
+      throw new Error("上传来源文件必须是图片格式");
+    }
+    return buildImageInput("uploaded_file", file, file.name || "uploaded-source.png");
   }
 
   const selected = aiState.gallery.find((item) => item.selectedAsSource);
@@ -2360,6 +2401,8 @@ async function restoreAiState(): Promise<void> {
   loadAiSettings();
   syncAiSettingsToUI();
   aiState.selectedSourceKind = getSelectedSourceKind();
+  setUploadedSourceFile(null);
+  syncAiSourceControls();
 
   try {
     const history = await loadAiHistory();
@@ -2639,7 +2682,7 @@ zoomModifierSelect.addEventListener("change", () => {
 aiModeSelect.addEventListener("change", () => {
   const mode = getActiveMode();
   const imageMode = mode === "image_to_image";
-  aiSourceKindSelect.disabled = !imageMode;
+  syncAiSourceControls();
   setStatus(imageMode ? "AI 模式：图生图（需要来源图）" : "AI 模式：文生图");
 });
 
@@ -2649,6 +2692,15 @@ aiProviderSelect.addEventListener("change", () => {
 
 aiSourceKindSelect.addEventListener("change", () => {
   aiState.selectedSourceKind = getSelectedSourceKind();
+  syncAiSourceControls();
+});
+
+aiUploadFileInput.addEventListener("change", () => {
+  const file = aiUploadFileInput.files?.[0] ?? null;
+  setUploadedSourceFile(file);
+  if (file) {
+    setStatus(`图生图来源已上传：${file.name}`);
+  }
 });
 
 openAiSettingsBtn.addEventListener("click", () => {
@@ -2687,6 +2739,18 @@ aiSettingsModal.addEventListener("click", (event) => {
   el.addEventListener("change", () => {
     syncAiSettingsFromUI();
   });
+});
+
+geminiModelPresetSelect.addEventListener("change", () => {
+  const selected = geminiModelPresetSelect.value as GeminiModelPresetId;
+  if (selected !== "custom") {
+    geminiModelInput.value = GEMINI_MODEL_PRESET_BY_ID[selected].model;
+  }
+  syncAiSettingsFromUI();
+});
+
+geminiModelInput.addEventListener("input", () => {
+  geminiModelPresetSelect.value = resolveGeminiModelPreset(geminiModelInput.value);
 });
 
 chooseOutputDirBtn.addEventListener("click", async () => {
