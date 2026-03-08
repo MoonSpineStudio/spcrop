@@ -359,6 +359,25 @@ button:hover {
   font-size: 15px;
 }
 
+.row-source-preview > label {
+  align-self: start;
+  padding-top: 4px;
+}
+
+.ai-source-preview {
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  padding: 6px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.ai-source-preview-image {
+  width: 100%;
+  display: block;
+  border-radius: 6px;
+  margin-bottom: 6px;
+}
+
 .ai-gallery {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

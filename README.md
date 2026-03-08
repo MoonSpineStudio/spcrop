@@ -32,6 +32,8 @@ Image cropping, arranging, and exporting tool.
 - Active layer supports rotation via top handle drag
 - Hold Shift while rotating a layer to snap angle (15° step)
 - `Cmd/Ctrl+Z` undo for recent editing actions
+- `Ctrl/Cmd+C` supports copying selected layers (falls back to crop copy when crop is active)
+- `Ctrl/Cmd+V` supports pasting system clipboard images as new layers
 - AI text-to-image and image-to-image generation panel
 - Image-to-image supports crop / active layer / gallery item / uploaded file as source
 - Gemini model presets include NanoBanana, NanoBanana Pro, and NanoBanana 2

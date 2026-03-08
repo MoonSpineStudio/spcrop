@@ -1,5 +1,11 @@
 import "./styles.css";
-import { resolveGlobalClipboardAction } from "./clipboard-shortcuts";
+import { resolveGlobalClipboardAction, resolvePasteAction } from "./clipboard-shortcuts";
+import { extractClipboardImageFiles } from "./clipboard-images";
+import {
+  buildLayerClipboardPayload,
+  placeLayerClipboardPayload,
+  type LayerClipboardPayload,
+} from "./layer-clipboard";
 import { createGalleryItemsFromAssets, markSelectedSource } from "./ai/gallery-store";
 import {
   loadAiHistory,
@@ -30,6 +36,7 @@ import {
   normalizeGeminiModelId,
   type ProviderModelPreset,
 } from "./ai/ui-options";
+import { describeSourcePreviewHint } from "./ai/source-preview";
 import {
   accumulateRotation,
   findRotateHandleIndex,
@@ -155,6 +162,7 @@ interface EditorSnapshot {
   selectedLayerIds: number[];
   cropRect: CropRect | null;
   clipboardImage: HTMLCanvasElement | null;
+  clipboardLayers: LayerClipboardPayload<HTMLCanvasElement> | null;
   clipboardPasteCursor: Point | null;
 }
 
@@ -267,6 +275,7 @@ interface AppState {
   draggingGroup: DraggingGroupItem[] | null;
   dragStartPointer: Point | null;
   clipboardImage: HTMLCanvasElement | null;
+  clipboardLayers: LayerClipboardPayload<HTMLCanvasElement> | null;
   clipboardPasteCursor: Point | null;
 }
 
@@ -322,6 +331,9 @@ const aiModelCustomRow = mustGet<HTMLDivElement>("aiModelCustomRow");
 const aiModelCustomInput = mustGet<HTMLInputElement>("aiModelCustom");
 const aiModeSelect = mustGet<HTMLSelectElement>("aiMode");
 const aiSourceKindSelect = mustGet<HTMLSelectElement>("aiSourceKind");
+const aiSourcePreviewRow = mustGet<HTMLDivElement>("aiSourcePreviewRow");
+const aiSourcePreviewImage = mustGet<HTMLImageElement>("aiSourcePreviewImage");
+const aiSourcePreviewMeta = mustGet<HTMLDivElement>("aiSourcePreviewMeta");
 const aiUploadFileRow = mustGet<HTMLDivElement>("aiUploadFileRow");
 const aiUploadFileInput = mustGet<HTMLInputElement>("aiUploadFile");
 const aiUploadFileName = mustGet<HTMLDivElement>("aiUploadFileName");
@@ -382,6 +394,7 @@ const state: AppState = {
   draggingGroup: null,
   dragStartPointer: null,
   clipboardImage: null,
+  clipboardLayers: null,
   clipboardPasteCursor: null,
 };
 
@@ -396,6 +409,8 @@ const aiState: AiRuntimeState = {
   taskAbortControllers: new Map<string, AbortController>(),
   persistingHistory: null,
 };
+
+let aiSourcePreviewObjectUrl: string | null = null;
 
 const undoHistory = createHistory<EditorSnapshot>(60);
 
@@ -1134,6 +1149,7 @@ function refreshLayerList(): void {
     li.appendChild(body);
     layerList.appendChild(li);
   }
+  refreshAiSourcePreview();
 }
 
 function moveLayers(layers: Layer[], dx: number, dy: number): void {
@@ -1444,6 +1460,29 @@ function cloneLayerImageForSnapshot(layer: Layer): HTMLCanvasElement | null {
   return out;
 }
 
+function cloneClipboardLayerPayload(
+  payload: LayerClipboardPayload<HTMLCanvasElement> | null,
+): LayerClipboardPayload<HTMLCanvasElement> | null {
+  if (!payload) {
+    return null;
+  }
+  const items: LayerClipboardPayload<HTMLCanvasElement>["items"] = [];
+  for (const item of payload.items) {
+    const image = cloneCanvasImage(item.image);
+    if (!image) {
+      return null;
+    }
+    items.push({
+      ...item,
+      image,
+    });
+  }
+  return {
+    anchor: { ...payload.anchor },
+    items,
+  };
+}
+
 function captureEditorSnapshot(): EditorSnapshot | null {
   const layers: LayerSnapshot[] = [];
   for (const layer of state.layers) {
@@ -1467,6 +1506,10 @@ function captureEditorSnapshot(): EditorSnapshot | null {
   if (state.clipboardImage && !clipboardImage) {
     return null;
   }
+  const clipboardLayers = cloneClipboardLayerPayload(state.clipboardLayers);
+  if (state.clipboardLayers && !clipboardLayers) {
+    return null;
+  }
 
   return {
     layers,
@@ -1475,6 +1518,7 @@ function captureEditorSnapshot(): EditorSnapshot | null {
     selectedLayerIds: [...state.selectedLayerIds],
     cropRect: state.cropRect ? { ...state.cropRect } : null,
     clipboardImage,
+    clipboardLayers,
     clipboardPasteCursor: state.clipboardPasteCursor ? { ...state.clipboardPasteCursor } : null,
   };
 }
@@ -1503,6 +1547,7 @@ function restoreEditorSnapshot(snapshot: EditorSnapshot): void {
   state.selectedLayerIds = new Set<number>(snapshot.selectedLayerIds);
   state.cropRect = snapshot.cropRect ? { ...snapshot.cropRect } : null;
   state.clipboardImage = snapshot.clipboardImage ? cloneCanvasImage(snapshot.clipboardImage) : null;
+  state.clipboardLayers = cloneClipboardLayerPayload(snapshot.clipboardLayers);
   state.clipboardPasteCursor = snapshot.clipboardPasteCursor ? { ...snapshot.clipboardPasteCursor } : null;
 }
 
@@ -1866,7 +1911,7 @@ function refreshActionButtonLabels(): void {
   cropModeBtn.textContent = `${state.cropMode ? "结束框选" : "开始框选"} (${shortcutText("toggleCropMode")})`;
   clearCropBtn.textContent = `清除框选 (${shortcutText("clearCrop")})`;
   createLayerBtn.textContent = `从框选生成新图层 (${shortcutText("createLayerFromCrop")})`;
-  copyCropBtn.textContent = `复制框选内容 (${shortcutText("copyCropSelection")} / Cmd+C)`;
+  copyCropBtn.textContent = `复制框选/选中图层 (${shortcutText("copyCropSelection")} / Cmd+C)`;
   pasteCropBtn.textContent = `粘贴为新图层 (${shortcutText("pasteCropSelection")} / Cmd+V)`;
   setCropRectBtn.textContent = `一键创建框选 (${shortcutText("setPresetCropRect")})`;
   removeFakeBgBtn.textContent = `去除仿PNG背景（选中优先） (${shortcutText("removeFakePngBg")})`;
@@ -2059,9 +2104,135 @@ function getSelectedSourceKind(): ImageSourceKind {
   return isImageSourceKind(raw) ? raw : "crop";
 }
 
+function getSelectedGallerySource(): GalleryItem | null {
+  const selected = aiState.gallery.find((item) => item.selectedAsSource);
+  return selected ?? null;
+}
+
+function revokeAiSourcePreviewObjectUrl(): void {
+  if (!aiSourcePreviewObjectUrl) {
+    return;
+  }
+  URL.revokeObjectURL(aiSourcePreviewObjectUrl);
+  aiSourcePreviewObjectUrl = null;
+}
+
+function formatFileSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "0 B";
+  }
+  if (bytes < 1024) {
+    return `${Math.round(bytes)} B`;
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function resolveAiSourcePreviewContent(sourceKind: ImageSourceKind): { src: string | null; detail: string } {
+  if (sourceKind === "crop") {
+    const slice = getActiveCropSelectionResult();
+    if (!slice) {
+      return {
+        src: null,
+        detail: "当前没有可用框选区域",
+      };
+    }
+    return {
+      src: slice.image.toDataURL("image/png"),
+      detail: `${slice.image.width} x ${slice.image.height} px`,
+    };
+  }
+
+  if (sourceKind === "active_layer") {
+    const active = state.activeLayerId !== null ? getLayerById(state.activeLayerId) : null;
+    if (!active) {
+      return {
+        src: null,
+        detail: "请先选中活动图层",
+      };
+    }
+    const rendered = renderLayerToCanvas(active);
+    if (!rendered) {
+      return {
+        src: null,
+        detail: "无法生成活动图层来源图",
+      };
+    }
+    return {
+      src: rendered.toDataURL("image/png"),
+      detail: `${active.name} · ${Math.max(1, Math.round(active.width))} x ${Math.max(1, Math.round(active.height))} px`,
+    };
+  }
+
+  if (sourceKind === "gallery_item") {
+    const selected = getSelectedGallerySource();
+    if (!selected) {
+      return {
+        src: null,
+        detail: "请先在素材候选区选择一张来源图",
+      };
+    }
+    const width = selected.asset.width;
+    const height = selected.asset.height;
+    const sizeLabel = width && height ? `${width} x ${height} px` : "已选素材";
+    return {
+      src: selected.asset.thumbDataUrl,
+      detail: `${selected.provider} · ${sizeLabel}`,
+    };
+  }
+
+  const file = aiState.uploadedSourceFile;
+  if (!file) {
+    return {
+      src: null,
+      detail: "请先上传图生图来源文件",
+    };
+  }
+  aiSourcePreviewObjectUrl = URL.createObjectURL(file);
+  return {
+    src: aiSourcePreviewObjectUrl,
+    detail: `${file.name} · ${formatFileSize(file.size)}`,
+  };
+}
+
+function refreshAiSourcePreview(): void {
+  const mode = getActiveMode();
+  const sourceKind = getSelectedSourceKind();
+  const hint = describeSourcePreviewHint({
+    mode,
+    sourceKind,
+    hasCropSource: Boolean(getActiveCropSelectionResult()),
+    hasActiveLayerSource: state.activeLayerId !== null,
+    hasGallerySource: Boolean(getSelectedGallerySource()),
+    hasUploadedFileSource: Boolean(aiState.uploadedSourceFile),
+  });
+  aiSourcePreviewRow.hidden = !hint.visible;
+  revokeAiSourcePreviewObjectUrl();
+  if (!hint.visible) {
+    aiSourcePreviewImage.hidden = true;
+    aiSourcePreviewImage.removeAttribute("src");
+    aiSourcePreviewMeta.textContent = "来源预览仅在图生图模式显示";
+    return;
+  }
+
+  const preview = resolveAiSourcePreviewContent(sourceKind);
+  aiSourcePreviewMeta.textContent = `${hint.title} · ${preview.detail}`;
+
+  if (preview.src) {
+    aiSourcePreviewImage.src = preview.src;
+    aiSourcePreviewImage.hidden = false;
+  } else {
+    aiSourcePreviewImage.hidden = true;
+    aiSourcePreviewImage.removeAttribute("src");
+  }
+}
+
 function setUploadedSourceFile(file: File | null): void {
   aiState.uploadedSourceFile = file;
   aiUploadFileName.textContent = file ? `已选择：${file.name}` : "未选择文件";
+  refreshAiSourcePreview();
 }
 
 function syncAiSourceControls(): void {
@@ -2071,6 +2242,7 @@ function syncAiSourceControls(): void {
   const showUpload = imageMode && sourceKind === "uploaded_file";
   aiUploadFileRow.hidden = !showUpload;
   aiUploadFileInput.disabled = !showUpload;
+  refreshAiSourcePreview();
 }
 
 function makeProviderRequest(req: GenerateRequest): GenerateRequest {
@@ -2307,6 +2479,7 @@ function renderAiGallery(): void {
     card.appendChild(actions);
     aiGallery.appendChild(card);
   }
+  refreshAiSourcePreview();
 }
 
 async function resolveImageSource(kind: ImageSourceKind): Promise<ImageInput> {
@@ -2343,7 +2516,7 @@ async function resolveImageSource(kind: ImageSourceKind): Promise<ImageInput> {
     return buildImageInput("uploaded_file", file, file.name || "uploaded-source.png");
   }
 
-  const selected = aiState.gallery.find((item) => item.selectedAsSource);
+  const selected = getSelectedGallerySource();
   if (!selected) {
     throw new Error("请先在素材候选区选择一张来源图");
   }
@@ -2523,6 +2696,7 @@ async function restoreAiState(): Promise<void> {
 }
 
 window.addEventListener("resize", resizeCanvas);
+window.addEventListener("beforeunload", revokeAiSourcePreviewObjectUrl);
 resizeCanvas();
 
 ["dragenter", "dragover"].forEach((eventName) => {
@@ -2641,29 +2815,141 @@ setCropRectBtn.addEventListener("click", () => {
 });
 
 copyCropBtn.addEventListener("click", () => {
-  if (state.activeLayerId === null) {
-    setStatus("请先选中一个活动图层");
-    return;
-  }
-  if (!state.cropRect || state.cropRect.w < 1 || state.cropRect.h < 1) {
-    setStatus("请先框选区域");
-    return;
-  }
-
   const slice = getActiveCropSelectionResult();
-  if (!slice) {
-    setStatus("框选区域没有覆盖到活动图层");
+  if (slice) {
+    state.clipboardImage = slice.image;
+    state.clipboardLayers = null;
+    state.clipboardPasteCursor = { x: slice.worldX, y: slice.worldY };
+    setStatus(`已复制框选内容: ${slice.image.width}x${slice.image.height}`);
     return;
   }
 
-  state.clipboardImage = slice.image;
-  state.clipboardPasteCursor = { x: slice.worldX, y: slice.worldY };
-  setStatus(`已复制框选内容: ${slice.image.width}x${slice.image.height}`);
+  const selected = selectedLayersByOrder();
+  if (selected.length === 0) {
+    if (state.activeLayerId === null) {
+      setStatus("请先选中图层或框选区域");
+    } else if (!state.cropRect || state.cropRect.w < 1 || state.cropRect.h < 1) {
+      setStatus("请先框选区域，或直接复制选中图层");
+    } else {
+      setStatus("框选区域没有覆盖到活动图层，也没有选中可复制图层");
+    }
+    return;
+  }
+  const clipboardLayers = buildLayerClipboardPayload(
+    selected.map((layer) => {
+      const image = cloneLayerImageForSnapshot(layer);
+      if (!image) {
+        return null;
+      }
+      return {
+        name: layer.name,
+        width: layer.width,
+        height: layer.height,
+        x: layer.x,
+        y: layer.y,
+        rotation: layer.rotation,
+        image,
+      };
+    }).filter((item): item is {
+      name: string;
+      width: number;
+      height: number;
+      x: number;
+      y: number;
+      rotation: number;
+      image: HTMLCanvasElement;
+    } => Boolean(item)),
+  );
+  if (!clipboardLayers || clipboardLayers.items.length !== selected.length) {
+    setStatus("复制失败：无法读取选中图层内容");
+    return;
+  }
+  state.clipboardLayers = clipboardLayers;
+  state.clipboardImage = null;
+  state.clipboardPasteCursor = {
+    x: clipboardLayers.anchor.x + 24,
+    y: clipboardLayers.anchor.y + 24,
+  };
+  setStatus(`已复制 ${selected.length} 个选中图层`);
 });
 
 pasteCropBtn.addEventListener("click", () => {
+  if (state.clipboardLayers && state.clipboardLayers.items.length > 0) {
+    const defaultPos = screenToWorld({ x: 16, y: 16 });
+    let originX = defaultPos.x;
+    let originY = defaultPos.y;
+    if (state.cropRect) {
+      originX = state.cropRect.x;
+      originY = state.cropRect.y;
+    } else if (state.clipboardPasteCursor) {
+      originX = state.clipboardPasteCursor.x;
+      originY = state.clipboardPasteCursor.y;
+    } else if (state.activeLayerId !== null) {
+      const active = getLayerById(state.activeLayerId);
+      if (active) {
+        originX = active.x + 24;
+        originY = active.y + 24;
+      }
+    }
+    const placements = placeLayerClipboardPayload(state.clipboardLayers, {
+      x: Math.round(originX),
+      y: Math.round(originY),
+    });
+    const prepared = placements.map((item) => {
+      const image = cloneCanvasImage(item.image);
+      if (!image) {
+        return null;
+      }
+      return {
+        ...item,
+        image,
+      };
+    });
+    if (prepared.some((item) => !item)) {
+      setStatus("粘贴失败：2D 上下文不可用");
+      return;
+    }
+
+    recordUndoSnapshot();
+    const newIds: number[] = [];
+    for (const item of prepared) {
+      if (!item) {
+        continue;
+      }
+      const id = state.nextLayerId++;
+      state.layers.push({
+        id,
+        name: `${item.name}-copy#${id}`,
+        image: item.image,
+        width: item.width,
+        height: item.height,
+        x: Math.round(item.x),
+        y: Math.round(item.y),
+        rotation: item.rotation,
+      });
+      newIds.push(id);
+    }
+    if (newIds.length === 0) {
+      setStatus("粘贴失败：没有可用图层数据");
+      return;
+    }
+    state.selectedLayerIds.clear();
+    for (const id of newIds) {
+      state.selectedLayerIds.add(id);
+    }
+    state.activeLayerId = newIds[newIds.length - 1] ?? null;
+    state.clipboardPasteCursor = {
+      x: Math.round(originX) + 16,
+      y: Math.round(originY) + 16,
+    };
+    refreshLayerList();
+    render();
+    setStatus(`已粘贴 ${newIds.length} 个图层`);
+    return;
+  }
+
   if (!state.clipboardImage) {
-    setStatus("剪贴板为空，请先复制框选内容");
+    setStatus("剪贴板为空，请先复制框选区域或选中图层");
     return;
   }
 
@@ -3152,6 +3438,7 @@ stage.addEventListener("mouseup", () => {
   state.rotatingLayer = null;
   state.draggingGroup = null;
   state.dragStartPointer = null;
+  refreshAiSourcePreview();
 });
 
 stage.addEventListener("mouseleave", () => {
@@ -3168,6 +3455,7 @@ stage.addEventListener("mouseleave", () => {
   state.rotatingLayer = null;
   state.draggingGroup = null;
   state.dragStartPointer = null;
+  refreshAiSourcePreview();
 });
 
 createLayerBtn.addEventListener("click", () => {
@@ -3413,8 +3701,6 @@ window.addEventListener("keydown", (event: KeyboardEvent) => {
   }
 
   if (clipboardAction === "pasteCropSelection") {
-    event.preventDefault();
-    pasteCropBtn.click();
     return;
   }
 
@@ -3470,6 +3756,45 @@ window.addEventListener("keydown", (event: KeyboardEvent) => {
   refreshLayerList();
   render();
   setStatus(`已移动 ${state.selectedLayerIds.size} 个图层 (${dx}, ${dy})`);
+});
+
+window.addEventListener("paste", (event: ClipboardEvent) => {
+  const typing = isTypingTarget(event.target);
+  const imageFiles = extractClipboardImageFiles(event.clipboardData);
+  const action = resolvePasteAction({
+    typing,
+    hasSystemClipboardImage: imageFiles.length > 0,
+    hasInternalClipboardImage: Boolean(state.clipboardImage || (state.clipboardLayers && state.clipboardLayers.items.length > 0)),
+  });
+  if (!action) {
+    return;
+  }
+
+  event.preventDefault();
+
+  if (action === "internal_crop") {
+    pasteCropBtn.click();
+    return;
+  }
+
+  if (imageFiles.length === 0) {
+    return;
+  }
+  void (async () => {
+    try {
+      for (let i = 0; i < imageFiles.length; i++) {
+        const file = imageFiles[i];
+        // eslint-disable-next-line no-await-in-loop
+        await addLayerFromBlob(file, `clipboard-paste-${i + 1}`);
+      }
+      if (imageFiles.length > 1) {
+        setStatus(`已从系统剪贴板粘贴 ${imageFiles.length} 张图片`);
+      }
+    } catch (error) {
+      const message = taskErrorToMessage(error);
+      setStatus(`粘贴系统剪贴板图片失败：${message}`);
+    }
+  })();
 });
 
 loadShortcutMap();
