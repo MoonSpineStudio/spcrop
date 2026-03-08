@@ -1,6 +1,11 @@
 import "./styles.css";
 import { resolveGlobalClipboardAction, resolvePasteAction } from "./clipboard-shortcuts";
 import { extractClipboardImageFiles } from "./clipboard-images";
+import {
+  buildLayerClipboardPayload,
+  placeLayerClipboardPayload,
+  type LayerClipboardPayload,
+} from "./layer-clipboard";
 import { createGalleryItemsFromAssets, markSelectedSource } from "./ai/gallery-store";
 import {
   loadAiHistory,
@@ -157,6 +162,7 @@ interface EditorSnapshot {
   selectedLayerIds: number[];
   cropRect: CropRect | null;
   clipboardImage: HTMLCanvasElement | null;
+  clipboardLayers: LayerClipboardPayload<HTMLCanvasElement> | null;
   clipboardPasteCursor: Point | null;
 }
 
@@ -269,6 +275,7 @@ interface AppState {
   draggingGroup: DraggingGroupItem[] | null;
   dragStartPointer: Point | null;
   clipboardImage: HTMLCanvasElement | null;
+  clipboardLayers: LayerClipboardPayload<HTMLCanvasElement> | null;
   clipboardPasteCursor: Point | null;
 }
 
@@ -387,6 +394,7 @@ const state: AppState = {
   draggingGroup: null,
   dragStartPointer: null,
   clipboardImage: null,
+  clipboardLayers: null,
   clipboardPasteCursor: null,
 };
 
@@ -1452,6 +1460,29 @@ function cloneLayerImageForSnapshot(layer: Layer): HTMLCanvasElement | null {
   return out;
 }
 
+function cloneClipboardLayerPayload(
+  payload: LayerClipboardPayload<HTMLCanvasElement> | null,
+): LayerClipboardPayload<HTMLCanvasElement> | null {
+  if (!payload) {
+    return null;
+  }
+  const items: LayerClipboardPayload<HTMLCanvasElement>["items"] = [];
+  for (const item of payload.items) {
+    const image = cloneCanvasImage(item.image);
+    if (!image) {
+      return null;
+    }
+    items.push({
+      ...item,
+      image,
+    });
+  }
+  return {
+    anchor: { ...payload.anchor },
+    items,
+  };
+}
+
 function captureEditorSnapshot(): EditorSnapshot | null {
   const layers: LayerSnapshot[] = [];
   for (const layer of state.layers) {
@@ -1475,6 +1506,10 @@ function captureEditorSnapshot(): EditorSnapshot | null {
   if (state.clipboardImage && !clipboardImage) {
     return null;
   }
+  const clipboardLayers = cloneClipboardLayerPayload(state.clipboardLayers);
+  if (state.clipboardLayers && !clipboardLayers) {
+    return null;
+  }
 
   return {
     layers,
@@ -1483,6 +1518,7 @@ function captureEditorSnapshot(): EditorSnapshot | null {
     selectedLayerIds: [...state.selectedLayerIds],
     cropRect: state.cropRect ? { ...state.cropRect } : null,
     clipboardImage,
+    clipboardLayers,
     clipboardPasteCursor: state.clipboardPasteCursor ? { ...state.clipboardPasteCursor } : null,
   };
 }
@@ -1511,6 +1547,7 @@ function restoreEditorSnapshot(snapshot: EditorSnapshot): void {
   state.selectedLayerIds = new Set<number>(snapshot.selectedLayerIds);
   state.cropRect = snapshot.cropRect ? { ...snapshot.cropRect } : null;
   state.clipboardImage = snapshot.clipboardImage ? cloneCanvasImage(snapshot.clipboardImage) : null;
+  state.clipboardLayers = cloneClipboardLayerPayload(snapshot.clipboardLayers);
   state.clipboardPasteCursor = snapshot.clipboardPasteCursor ? { ...snapshot.clipboardPasteCursor } : null;
 }
 
@@ -1874,7 +1911,7 @@ function refreshActionButtonLabels(): void {
   cropModeBtn.textContent = `${state.cropMode ? "结束框选" : "开始框选"} (${shortcutText("toggleCropMode")})`;
   clearCropBtn.textContent = `清除框选 (${shortcutText("clearCrop")})`;
   createLayerBtn.textContent = `从框选生成新图层 (${shortcutText("createLayerFromCrop")})`;
-  copyCropBtn.textContent = `复制框选内容 (${shortcutText("copyCropSelection")} / Cmd+C)`;
+  copyCropBtn.textContent = `复制框选/选中图层 (${shortcutText("copyCropSelection")} / Cmd+C)`;
   pasteCropBtn.textContent = `粘贴为新图层 (${shortcutText("pasteCropSelection")} / Cmd+V)`;
   setCropRectBtn.textContent = `一键创建框选 (${shortcutText("setPresetCropRect")})`;
   removeFakeBgBtn.textContent = `去除仿PNG背景（选中优先） (${shortcutText("removeFakePngBg")})`;
@@ -2778,29 +2815,141 @@ setCropRectBtn.addEventListener("click", () => {
 });
 
 copyCropBtn.addEventListener("click", () => {
-  if (state.activeLayerId === null) {
-    setStatus("请先选中一个活动图层");
-    return;
-  }
-  if (!state.cropRect || state.cropRect.w < 1 || state.cropRect.h < 1) {
-    setStatus("请先框选区域");
-    return;
-  }
-
   const slice = getActiveCropSelectionResult();
-  if (!slice) {
-    setStatus("框选区域没有覆盖到活动图层");
+  if (slice) {
+    state.clipboardImage = slice.image;
+    state.clipboardLayers = null;
+    state.clipboardPasteCursor = { x: slice.worldX, y: slice.worldY };
+    setStatus(`已复制框选内容: ${slice.image.width}x${slice.image.height}`);
     return;
   }
 
-  state.clipboardImage = slice.image;
-  state.clipboardPasteCursor = { x: slice.worldX, y: slice.worldY };
-  setStatus(`已复制框选内容: ${slice.image.width}x${slice.image.height}`);
+  const selected = selectedLayersByOrder();
+  if (selected.length === 0) {
+    if (state.activeLayerId === null) {
+      setStatus("请先选中图层或框选区域");
+    } else if (!state.cropRect || state.cropRect.w < 1 || state.cropRect.h < 1) {
+      setStatus("请先框选区域，或直接复制选中图层");
+    } else {
+      setStatus("框选区域没有覆盖到活动图层，也没有选中可复制图层");
+    }
+    return;
+  }
+  const clipboardLayers = buildLayerClipboardPayload(
+    selected.map((layer) => {
+      const image = cloneLayerImageForSnapshot(layer);
+      if (!image) {
+        return null;
+      }
+      return {
+        name: layer.name,
+        width: layer.width,
+        height: layer.height,
+        x: layer.x,
+        y: layer.y,
+        rotation: layer.rotation,
+        image,
+      };
+    }).filter((item): item is {
+      name: string;
+      width: number;
+      height: number;
+      x: number;
+      y: number;
+      rotation: number;
+      image: HTMLCanvasElement;
+    } => Boolean(item)),
+  );
+  if (!clipboardLayers || clipboardLayers.items.length !== selected.length) {
+    setStatus("复制失败：无法读取选中图层内容");
+    return;
+  }
+  state.clipboardLayers = clipboardLayers;
+  state.clipboardImage = null;
+  state.clipboardPasteCursor = {
+    x: clipboardLayers.anchor.x + 24,
+    y: clipboardLayers.anchor.y + 24,
+  };
+  setStatus(`已复制 ${selected.length} 个选中图层`);
 });
 
 pasteCropBtn.addEventListener("click", () => {
+  if (state.clipboardLayers && state.clipboardLayers.items.length > 0) {
+    const defaultPos = screenToWorld({ x: 16, y: 16 });
+    let originX = defaultPos.x;
+    let originY = defaultPos.y;
+    if (state.cropRect) {
+      originX = state.cropRect.x;
+      originY = state.cropRect.y;
+    } else if (state.clipboardPasteCursor) {
+      originX = state.clipboardPasteCursor.x;
+      originY = state.clipboardPasteCursor.y;
+    } else if (state.activeLayerId !== null) {
+      const active = getLayerById(state.activeLayerId);
+      if (active) {
+        originX = active.x + 24;
+        originY = active.y + 24;
+      }
+    }
+    const placements = placeLayerClipboardPayload(state.clipboardLayers, {
+      x: Math.round(originX),
+      y: Math.round(originY),
+    });
+    const prepared = placements.map((item) => {
+      const image = cloneCanvasImage(item.image);
+      if (!image) {
+        return null;
+      }
+      return {
+        ...item,
+        image,
+      };
+    });
+    if (prepared.some((item) => !item)) {
+      setStatus("粘贴失败：2D 上下文不可用");
+      return;
+    }
+
+    recordUndoSnapshot();
+    const newIds: number[] = [];
+    for (const item of prepared) {
+      if (!item) {
+        continue;
+      }
+      const id = state.nextLayerId++;
+      state.layers.push({
+        id,
+        name: `${item.name}-copy#${id}`,
+        image: item.image,
+        width: item.width,
+        height: item.height,
+        x: Math.round(item.x),
+        y: Math.round(item.y),
+        rotation: item.rotation,
+      });
+      newIds.push(id);
+    }
+    if (newIds.length === 0) {
+      setStatus("粘贴失败：没有可用图层数据");
+      return;
+    }
+    state.selectedLayerIds.clear();
+    for (const id of newIds) {
+      state.selectedLayerIds.add(id);
+    }
+    state.activeLayerId = newIds[newIds.length - 1] ?? null;
+    state.clipboardPasteCursor = {
+      x: Math.round(originX) + 16,
+      y: Math.round(originY) + 16,
+    };
+    refreshLayerList();
+    render();
+    setStatus(`已粘贴 ${newIds.length} 个图层`);
+    return;
+  }
+
   if (!state.clipboardImage) {
-    setStatus("剪贴板为空，请先复制框选内容");
+    setStatus("剪贴板为空，请先复制框选区域或选中图层");
     return;
   }
 
@@ -3615,7 +3764,7 @@ window.addEventListener("paste", (event: ClipboardEvent) => {
   const action = resolvePasteAction({
     typing,
     hasSystemClipboardImage: imageFiles.length > 0,
-    hasInternalClipboardImage: Boolean(state.clipboardImage),
+    hasInternalClipboardImage: Boolean(state.clipboardImage || (state.clipboardLayers && state.clipboardLayers.items.length > 0)),
   });
   if (!action) {
     return;
