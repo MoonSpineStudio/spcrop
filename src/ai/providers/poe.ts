@@ -1,5 +1,3 @@
-import OpenAI, { APIError } from "openai";
-
 import { dataUrlToBlob, makeGeneratedAsset } from "../image-utils";
 import type { GenerateRequest, ProviderAdapter } from "../types";
 
@@ -25,6 +23,13 @@ export function normalizePoeBaseUrl(baseUrl: string): string {
     return noTrailingSlash;
   }
   return `${noTrailingSlash}/v1`;
+}
+
+export function createPoeRequestHeaders(apiKey: string): Record<string, string> {
+  return {
+    Authorization: `Bearer ${apiKey}`,
+    "Content-Type": "application/json",
+  };
 }
 
 function buildPromptText(req: GenerateRequest): string {
@@ -140,10 +145,61 @@ async function blobToDataUrl(blob: Blob): Promise<string> {
   });
 }
 
-function toPoeError(error: unknown): Error {
-  if (error instanceof APIError) {
-    return new Error(`POE request failed (${error.status ?? "unknown"}): ${error.message}`);
+function extractPoeErrorMessage(body: unknown): string | undefined {
+  if (!isRecord(body)) {
+    return undefined;
   }
+  if (isRecord(body.error)) {
+    const nested = toNonEmptyString(body.error.message);
+    if (nested) {
+      return nested;
+    }
+  }
+  return toNonEmptyString(body.message);
+}
+
+async function callPoeChatCompletions(
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+  content: PoeUserContent,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  const endpoint = `${normalizePoeBaseUrl(baseUrl)}/chat/completions`;
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: createPoeRequestHeaders(apiKey),
+    body: JSON.stringify({
+      model,
+      messages: [
+        {
+          role: "user",
+          content,
+        },
+      ],
+      stream: false,
+    }),
+    signal,
+  });
+
+  const text = await response.text();
+  let parsed: unknown = {};
+  if (text) {
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = { message: text };
+    }
+  }
+
+  if (!response.ok) {
+    const message = extractPoeErrorMessage(parsed) ?? `HTTP ${response.status}`;
+    throw new Error(`POE request failed (${response.status}): ${message}`);
+  }
+  return parsed;
+}
+
+function toPoeError(error: unknown): Error {
   if (error instanceof Error) {
     return new Error(`POE request failed: ${error.message}`);
   }
@@ -158,12 +214,6 @@ export function createPoeAdapter(getConfig: () => PoeConfig): ProviderAdapter {
       if (!apiKey) {
         throw new Error("Missing POE API key");
       }
-
-      const client = new OpenAI({
-        apiKey,
-        baseURL: normalizePoeBaseUrl(config.baseUrl || "https://api.poe.com"),
-        dangerouslyAllowBrowser: true,
-      });
 
       const prompt = buildPromptText(req);
       const runs = Math.max(1, req.outputCount);
@@ -187,18 +237,13 @@ export function createPoeAdapter(getConfig: () => PoeConfig): ProviderAdapter {
             : prompt;
 
           // eslint-disable-next-line no-await-in-loop
-          const response = await client.chat.completions.create({
-            model: req.model,
-            messages: [
-              {
-                role: "user",
-                content,
-              },
-            ],
-            stream: false,
-          }, {
+          const response = await callPoeChatCompletions(
+            config.baseUrl || "https://api.poe.com",
+            apiKey,
+            req.model,
+            content,
             signal,
-          });
+          );
 
           const imageUrls = collectImageUrlsFromPoeResponse(response);
           for (const url of imageUrls) {

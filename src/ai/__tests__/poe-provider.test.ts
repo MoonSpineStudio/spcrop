@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   collectImageUrlsFromPoeResponse,
+  createPoeRequestHeaders,
   normalizePoeBaseUrl,
 } from "../providers/poe";
 
@@ -35,5 +36,17 @@ describe("collectImageUrlsFromPoeResponse", () => {
       "https://example.com/a.png",
       "https://example.com/b.png",
     ]);
+  });
+});
+
+describe("createPoeRequestHeaders", () => {
+  it("only includes authorization and content-type for CORS-safe browser calls", () => {
+    const headers = createPoeRequestHeaders("test_key");
+
+    expect(headers).toEqual({
+      Authorization: "Bearer test_key",
+      "Content-Type": "application/json",
+    });
+    expect(Object.keys(headers).some((key) => key.toLowerCase().startsWith("x-stainless"))).toBe(false);
   });
 });
