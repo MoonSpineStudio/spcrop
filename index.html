@@ -100,6 +100,13 @@
             <option value="uploaded_file">上传文件</option>
           </select>
         </div>
+        <div class="row row-source-preview" id="aiSourcePreviewRow" hidden>
+          <label for="aiSourcePreviewImage">来源预览</label>
+          <div class="ai-source-preview">
+            <img id="aiSourcePreviewImage" class="ai-source-preview-image" alt="图生图来源预览" hidden />
+            <div id="aiSourcePreviewMeta" class="mini-status">来源预览未就绪</div>
+          </div>
+        </div>
         <div class="row row-file" id="aiUploadFileRow" hidden>
           <label for="aiUploadFile">来源文件</label>
           <div>

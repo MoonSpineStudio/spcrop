@@ -30,6 +30,7 @@ import {
   normalizeGeminiModelId,
   type ProviderModelPreset,
 } from "./ai/ui-options";
+import { describeSourcePreviewHint } from "./ai/source-preview";
 import {
   accumulateRotation,
   findRotateHandleIndex,
@@ -322,6 +323,9 @@ const aiModelCustomRow = mustGet<HTMLDivElement>("aiModelCustomRow");
 const aiModelCustomInput = mustGet<HTMLInputElement>("aiModelCustom");
 const aiModeSelect = mustGet<HTMLSelectElement>("aiMode");
 const aiSourceKindSelect = mustGet<HTMLSelectElement>("aiSourceKind");
+const aiSourcePreviewRow = mustGet<HTMLDivElement>("aiSourcePreviewRow");
+const aiSourcePreviewImage = mustGet<HTMLImageElement>("aiSourcePreviewImage");
+const aiSourcePreviewMeta = mustGet<HTMLDivElement>("aiSourcePreviewMeta");
 const aiUploadFileRow = mustGet<HTMLDivElement>("aiUploadFileRow");
 const aiUploadFileInput = mustGet<HTMLInputElement>("aiUploadFile");
 const aiUploadFileName = mustGet<HTMLDivElement>("aiUploadFileName");
@@ -396,6 +400,8 @@ const aiState: AiRuntimeState = {
   taskAbortControllers: new Map<string, AbortController>(),
   persistingHistory: null,
 };
+
+let aiSourcePreviewObjectUrl: string | null = null;
 
 const undoHistory = createHistory<EditorSnapshot>(60);
 
@@ -1134,6 +1140,7 @@ function refreshLayerList(): void {
     li.appendChild(body);
     layerList.appendChild(li);
   }
+  refreshAiSourcePreview();
 }
 
 function moveLayers(layers: Layer[], dx: number, dy: number): void {
@@ -2059,9 +2066,135 @@ function getSelectedSourceKind(): ImageSourceKind {
   return isImageSourceKind(raw) ? raw : "crop";
 }
 
+function getSelectedGallerySource(): GalleryItem | null {
+  const selected = aiState.gallery.find((item) => item.selectedAsSource);
+  return selected ?? null;
+}
+
+function revokeAiSourcePreviewObjectUrl(): void {
+  if (!aiSourcePreviewObjectUrl) {
+    return;
+  }
+  URL.revokeObjectURL(aiSourcePreviewObjectUrl);
+  aiSourcePreviewObjectUrl = null;
+}
+
+function formatFileSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "0 B";
+  }
+  if (bytes < 1024) {
+    return `${Math.round(bytes)} B`;
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function resolveAiSourcePreviewContent(sourceKind: ImageSourceKind): { src: string | null; detail: string } {
+  if (sourceKind === "crop") {
+    const slice = getActiveCropSelectionResult();
+    if (!slice) {
+      return {
+        src: null,
+        detail: "当前没有可用框选区域",
+      };
+    }
+    return {
+      src: slice.image.toDataURL("image/png"),
+      detail: `${slice.image.width} x ${slice.image.height} px`,
+    };
+  }
+
+  if (sourceKind === "active_layer") {
+    const active = state.activeLayerId !== null ? getLayerById(state.activeLayerId) : null;
+    if (!active) {
+      return {
+        src: null,
+        detail: "请先选中活动图层",
+      };
+    }
+    const rendered = renderLayerToCanvas(active);
+    if (!rendered) {
+      return {
+        src: null,
+        detail: "无法生成活动图层来源图",
+      };
+    }
+    return {
+      src: rendered.toDataURL("image/png"),
+      detail: `${active.name} · ${Math.max(1, Math.round(active.width))} x ${Math.max(1, Math.round(active.height))} px`,
+    };
+  }
+
+  if (sourceKind === "gallery_item") {
+    const selected = getSelectedGallerySource();
+    if (!selected) {
+      return {
+        src: null,
+        detail: "请先在素材候选区选择一张来源图",
+      };
+    }
+    const width = selected.asset.width;
+    const height = selected.asset.height;
+    const sizeLabel = width && height ? `${width} x ${height} px` : "已选素材";
+    return {
+      src: selected.asset.thumbDataUrl,
+      detail: `${selected.provider} · ${sizeLabel}`,
+    };
+  }
+
+  const file = aiState.uploadedSourceFile;
+  if (!file) {
+    return {
+      src: null,
+      detail: "请先上传图生图来源文件",
+    };
+  }
+  aiSourcePreviewObjectUrl = URL.createObjectURL(file);
+  return {
+    src: aiSourcePreviewObjectUrl,
+    detail: `${file.name} · ${formatFileSize(file.size)}`,
+  };
+}
+
+function refreshAiSourcePreview(): void {
+  const mode = getActiveMode();
+  const sourceKind = getSelectedSourceKind();
+  const hint = describeSourcePreviewHint({
+    mode,
+    sourceKind,
+    hasCropSource: Boolean(getActiveCropSelectionResult()),
+    hasActiveLayerSource: state.activeLayerId !== null,
+    hasGallerySource: Boolean(getSelectedGallerySource()),
+    hasUploadedFileSource: Boolean(aiState.uploadedSourceFile),
+  });
+  aiSourcePreviewRow.hidden = !hint.visible;
+  revokeAiSourcePreviewObjectUrl();
+  if (!hint.visible) {
+    aiSourcePreviewImage.hidden = true;
+    aiSourcePreviewImage.removeAttribute("src");
+    aiSourcePreviewMeta.textContent = "来源预览仅在图生图模式显示";
+    return;
+  }
+
+  const preview = resolveAiSourcePreviewContent(sourceKind);
+  aiSourcePreviewMeta.textContent = `${hint.title} · ${preview.detail}`;
+
+  if (preview.src) {
+    aiSourcePreviewImage.src = preview.src;
+    aiSourcePreviewImage.hidden = false;
+  } else {
+    aiSourcePreviewImage.hidden = true;
+    aiSourcePreviewImage.removeAttribute("src");
+  }
+}
+
 function setUploadedSourceFile(file: File | null): void {
   aiState.uploadedSourceFile = file;
   aiUploadFileName.textContent = file ? `已选择：${file.name}` : "未选择文件";
+  refreshAiSourcePreview();
 }
 
 function syncAiSourceControls(): void {
@@ -2071,6 +2204,7 @@ function syncAiSourceControls(): void {
   const showUpload = imageMode && sourceKind === "uploaded_file";
   aiUploadFileRow.hidden = !showUpload;
   aiUploadFileInput.disabled = !showUpload;
+  refreshAiSourcePreview();
 }
 
 function makeProviderRequest(req: GenerateRequest): GenerateRequest {
@@ -2307,6 +2441,7 @@ function renderAiGallery(): void {
     card.appendChild(actions);
     aiGallery.appendChild(card);
   }
+  refreshAiSourcePreview();
 }
 
 async function resolveImageSource(kind: ImageSourceKind): Promise<ImageInput> {
@@ -2343,7 +2478,7 @@ async function resolveImageSource(kind: ImageSourceKind): Promise<ImageInput> {
     return buildImageInput("uploaded_file", file, file.name || "uploaded-source.png");
   }
 
-  const selected = aiState.gallery.find((item) => item.selectedAsSource);
+  const selected = getSelectedGallerySource();
   if (!selected) {
     throw new Error("请先在素材候选区选择一张来源图");
   }
@@ -2523,6 +2658,7 @@ async function restoreAiState(): Promise<void> {
 }
 
 window.addEventListener("resize", resizeCanvas);
+window.addEventListener("beforeunload", revokeAiSourcePreviewObjectUrl);
 resizeCanvas();
 
 ["dragenter", "dragover"].forEach((eventName) => {
@@ -3152,6 +3288,7 @@ stage.addEventListener("mouseup", () => {
   state.rotatingLayer = null;
   state.draggingGroup = null;
   state.dragStartPointer = null;
+  refreshAiSourcePreview();
 });
 
 stage.addEventListener("mouseleave", () => {
@@ -3168,6 +3305,7 @@ stage.addEventListener("mouseleave", () => {
   state.rotatingLayer = null;
   state.draggingGroup = null;
   state.dragStartPointer = null;
+  refreshAiSourcePreview();
 });
 
 createLayerBtn.addEventListener("click", () => {
